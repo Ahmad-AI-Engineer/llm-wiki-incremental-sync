@@ -1,12 +1,21 @@
+"""Authenticate against Odoo and store a session token.
+
+Odoo issues no OAuth token for username/password login, it issues a session_id
+cookie. That cookie is what gets stored; the password is used once and never
+written to disk.
+"""
 from __future__ import annotations
 
 import argparse
 import getpass
+import html
 import http.cookiejar
 import json
 import os
 import re
 import ssl
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -14,25 +23,28 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from hq_common import (BASE_DIR, add_common_arguments, now_iso, read_env,
-                       setup_logging)
+from hq_common import (CRED_FILE, UI_DIR, HQError, add_common_arguments,
+                       configure_logging, get_logger, now_iso, read_env)
 
-CRED_DIR = BASE_DIR / "credentials"
-CRED_FILE = CRED_DIR / "odoo_session.json"
+LOGIN_HTML_FILE = UI_DIR / "login.html"
+LOGIN_CSS_FILE = UI_DIR / "login.css"
+SUCCESS_HTML_FILE = UI_DIR / "success.html"
+
+SUCCESS_FALLBACK = ("<!doctype html><meta charset=\"utf-8\">"
+                    "<title>Authenticated</title><p>Signed in. "
+                    "You can close this tab.")
+
+SHUTDOWN_GRACE = 0.8
 
 DEFAULT_URL = "https://theaxiomworld.com"
 UI_HOST, UI_PORT = "127.0.0.1", 8765
 USER_AGENT = "HQ-Credentials-Manager/1.0"
 
-log = setup_logging("credentials-manager")
+log = get_logger("credentials-manager")
 
 
-class OdooAuthError(RuntimeError):
+class OdooAuthError(HQError):
     pass
-
-
-def _now() -> str:
-    return now_iso()
 
 
 def normalize_url(url: str) -> str:
@@ -54,7 +66,8 @@ def _ssl_context(verify: bool):
 
 def jsonrpc(url: str, path: str, params: dict, session_id: str | None = None,
             verify_ssl: bool = True, timeout: int = 60):
-    payload = json.dumps({"jsonrpc": "2.0", "method": "call", "params": params}).encode()
+    payload = json.dumps({"jsonrpc": "2.0", "method": "call",
+                          "params": params}).encode()
     headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
     if session_id:
         headers["Cookie"] = f"session_id={session_id}"
@@ -131,11 +144,16 @@ class OdooSessionAuth:
             "server_version": version,
             "is_admin": info.get("is_admin"),
             "verify_ssl": self.verify_ssl,
-            "created_at": _now(),
-            "last_validated_at": _now(),
+            "created_at": now_iso(),
+            "last_validated_at": now_iso(),
         }
 
     def _form_login(self, login: str, password: str) -> str | None:
+        """Post the HTML login form with its CSRF token.
+
+        This path needs no database name: the server resolves it via dbfilter.
+        Landing back on the login page means the credentials were rejected.
+        """
         try:
             with self.opener.open(f"{self.url}/web/login", timeout=60) as response:
                 page = response.read().decode("utf-8", "replace")
@@ -166,6 +184,7 @@ class OdooSessionAuth:
         return self._cookie()
 
     def _jsonrpc_login(self, login: str, password: str, db: str) -> str | None:
+        """Fallback for servers with no login form. Needs an explicit db name."""
         result = jsonrpc(self.url, "/web/session/authenticate",
                          {"db": db, "login": login, "password": password},
                          verify_ssl=self.verify_ssl)
@@ -200,7 +219,7 @@ def validate_credentials(record: dict) -> dict:
     record["uid"] = info["uid"]
     record["username"] = info.get("username", record.get("username"))
     record["db"] = info.get("db", record.get("db"))
-    record["last_validated_at"] = _now()
+    record["last_validated_at"] = now_iso()
     return record
 
 
@@ -211,46 +230,21 @@ def redact(record: dict) -> dict:
     return out
 
 
-LOGIN_PAGE = """<!doctype html>
-<html><head><meta charset="utf-8"><title>HQ Credentials Manager</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-  :root {{ color-scheme: light dark; }}
-  body {{ font: 15px/1.5 system-ui, sans-serif; max-width: 26rem; margin: 4rem auto;
-         padding: 0 1.25rem; }}
-  h1 {{ font-size: 1.15rem; margin-bottom: .25rem; }}
-  p.sub {{ color: #6b7280; margin-top: 0; font-size: .9rem; }}
-  label {{ display: block; margin: .9rem 0 .25rem; font-weight: 600; font-size: .82rem;
-          text-transform: uppercase; letter-spacing: .04em; color: #6b7280; }}
-  input[type=text], input[type=password] {{ width: 100%; padding: .55rem .65rem;
-          border: 1px solid #9ca3af; border-radius: 6px; background: transparent;
-          color: inherit; font: inherit; }}
-  button {{ margin-top: 1.4rem; width: 100%; padding: .6rem; border: 0; border-radius: 6px;
-           background: #4f46e5; color: #fff; font: inherit; font-weight: 600;
-           cursor: pointer; }}
-  .msg {{ margin-top: 1.2rem; padding: .7rem .8rem; border-radius: 6px; font-size: .9rem;
-         white-space: pre-wrap; }}
-  .ok {{ background: #dcfce7; color: #14532d; }}
-  .err {{ background: #fee2e2; color: #7f1d1d; }}
-  code {{ font-size: .85em; }}
-</style></head><body>
-<h1>HQ Credentials Manager</h1>
-<p class="sub">Sign in to Odoo. The password is used once to mint a session token
-and is never stored.</p>
-{message}
-<form method="post" action="/login">
-  <label for="url">Odoo URL</label>
-  <input type="text" id="url" name="url" value="{url}" required>
-  <label for="username">Username</label>
-  <input type="text" id="username" name="username" value="{username}"
-         autocomplete="username" required>
-  <label for="password">Password</label>
-  <input type="password" id="password" name="password" autocomplete="current-password"
-         required autofocus>
-  <button type="submit">Authenticate</button>
-</form>
-</body></html>
-"""
+def load_login_template() -> str:
+    try:
+        return LOGIN_HTML_FILE.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise OdooAuthError(f"Cannot read the login page at "
+                            f"{LOGIN_HTML_FILE}: {exc}") from None
+
+
+def load_success_page() -> str:
+    try:
+        return SUCCESS_HTML_FILE.read_text(encoding="utf-8")
+    except OSError as exc:
+        log.warning("cannot read %s (%s), using the plain success page",
+                    SUCCESS_HTML_FILE.name, exc)
+        return SUCCESS_FALLBACK
 
 
 class UIHandler(BaseHTTPRequestHandler):
@@ -259,22 +253,37 @@ class UIHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
-    def _render(self, message_html: str = "", status: int = 200) -> None:
-        defaults = env_defaults()
-        page = LOGIN_PAGE.format(message=message_html, url=defaults["url"],
-                                 username=defaults["username"])
-        body = page.encode("utf-8")
+    def _send(self, body: bytes, content_type: str, status: int = 200) -> None:
         self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self) -> None:
-        if self.path.split("?")[0] != "/":
-            self.send_error(404)
+    def _render(self, message_html: str = "", status: int = 200) -> None:
+        defaults = env_defaults()
+        try:
+            template = load_login_template()
+        except OdooAuthError as exc:
+            log.error("%s", exc)
+            self.send_error(500, "Login page template is missing")
             return
-        self._render()
+        page = template.format(message=message_html,
+                               url=html.escape(defaults["url"], quote=True),
+                               username=html.escape(defaults["username"], quote=True))
+        self._send(page.encode("utf-8"), "text/html; charset=utf-8", status)
+
+    def do_GET(self) -> None:
+        path = self.path.split("?")[0]
+        if path == "/":
+            self._render()
+        elif path == "/login.css":
+            try:
+                self._send(LOGIN_CSS_FILE.read_bytes(), "text/css; charset=utf-8")
+            except OSError:
+                self.send_error(404)
+        else:
+            self.send_error(404)
 
     def do_POST(self) -> None:
         if self.path != "/login":
@@ -287,24 +296,82 @@ class UIHandler(BaseHTTPRequestHandler):
             return (form.get(key) or [""])[0].strip()
 
         try:
-            auth = OdooSessionAuth(field("url") or DEFAULT_URL,
-                                   verify_ssl=field("verify_ssl") != "false")
-            record = auth.login(field("username"), field("password"), field("db"))
+            auth = OdooSessionAuth(env_defaults()["url"])
+            record = auth.login(field("username"), field("password"))
             path = save_credentials(record)
-            self._render(
-                f'<div class="msg ok">Authenticated as <strong>{record["name"]}'
-                f'</strong> (uid {record["uid"]}) on database <code>{record["db"]}</code>, '
-                f'Odoo {record["server_version"]}.\n\nToken saved to '
-                f'<code>{path.relative_to(BASE_DIR)}</code>. You can close this tab '
-                f'and run HQ-Scanner.py.</div>')
+            self._send(load_success_page().encode("utf-8"),
+                       "text/html; charset=utf-8")
             log.info("authenticated %s (uid %s) db=%s -> %s",
                      record["name"], record["uid"], record["db"], path)
+            self._signal_success(record)
         except OdooAuthError as exc:
-            self._render(f'<div class="msg err">{exc}</div>', status=200)
+            self._render(f'<div class="msg err">{html.escape(str(exc))}</div>')
             log.error("login failed: %s", exc)
+
+    def _signal_success(self, record: dict) -> None:
+        """Release login_via_browser, if that is what started this server."""
+        event = getattr(self.server, "login_event", None)
+        if event is not None:
+            self.server.login_record = record
+            event.set()
+
+
+def login_via_browser(host: str = UI_HOST, port: int = UI_PORT,
+                      open_browser: bool = True) -> dict:
+    """Serve the login page, wait for one successful login, return the record.
+
+    The wait polls rather than blocking outright, so Ctrl+C still works on
+    Windows, and lingers briefly afterwards so the success page reaches the
+    browser before the server closes.
+    """
+    load_login_template()
+    server = ThreadingHTTPServer((host, port), UIHandler)
+    server.login_event = threading.Event()
+    server.login_record = None
+
+    url = f"http://{host}:{port}/"
+    print(f"\n  Odoo login required -> {url}")
+    print("  Waiting for you to sign in (Ctrl+C to cancel)...")
+
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    if open_browser:
+        try:
+            webbrowser.open(url)
+        except Exception as exc:
+            log.debug("could not open a browser: %s", exc)
+
+    try:
+        while not server.login_event.wait(0.5):
+            pass
+        time.sleep(SHUTDOWN_GRACE)
+    except KeyboardInterrupt:
+        raise OdooAuthError("Login cancelled.") from None
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    return server.login_record
+
+
+def ensure_session(open_browser: bool = True) -> dict:
+    """A valid Odoo session, logging in through the browser if there is none.
+
+    Covers all three cases: no credentials file, an empty or unreadable one,
+    and a stored session the server has since expired.
+    """
+    try:
+        record = validate_credentials(load_credentials())
+    except (OdooAuthError, json.JSONDecodeError, KeyError) as exc:
+        log.info("no usable session (%s)", str(exc).splitlines()[0])
+        record = login_via_browser(open_browser=open_browser)
+    save_credentials(record)
+    log.info("session valid: %s (uid %s) on db %s",
+             record.get("username"), record.get("uid"), record.get("db"))
+    return record
 
 
 def cmd_ui(args: argparse.Namespace) -> int:
+    load_login_template()
     server = ThreadingHTTPServer((args.host, args.port), UIHandler)
     url = f"http://{args.host}:{args.port}/"
     print(f"HQ Credentials Manager UI -> {url}")
@@ -312,7 +379,7 @@ def cmd_ui(args: argparse.Namespace) -> int:
     if not args.no_browser:
         try:
             webbrowser.open(url)
-        except Exception as exc:  # headless environments simply skip this
+        except Exception as exc:
             log.debug("could not open a browser: %s", exc)
     try:
         server.serve_forever()
@@ -332,7 +399,8 @@ def cmd_login(args: argparse.Namespace) -> int:
     auth = OdooSessionAuth(url, verify_ssl=not args.insecure)
     record = auth.login(username, password, args.db or "")
     path = save_credentials(record)
-    print(f"Authenticated as {record['name']} <{record['username']}> (uid {record['uid']})")
+    print(f"Authenticated as {record['name']} <{record['username']}> "
+          f"(uid {record['uid']})")
     print(f"  database:       {record['db']}")
     print(f"  server version: {record['server_version']}")
     print(f"  token saved to: {path}")
@@ -380,7 +448,8 @@ def main(argv: list[str] | None = None) -> int:
     login.add_argument("--username", default=None)
     login.add_argument("--password", default=None,
                        help="omit to be prompted without echo")
-    login.add_argument("--db", default=None, help="only needed if form login is unavailable")
+    login.add_argument("--db", default=None,
+                       help="only needed if form login is unavailable")
     login.add_argument("--insecure", action="store_true", help="skip TLS verification")
     login.set_defaults(func=cmd_login)
 
@@ -390,11 +459,10 @@ def main(argv: list[str] | None = None) -> int:
         func=cmd_logout)
 
     args = parser.parse_args(argv)
-    if args.verbose:
-        setup_logging("credentials-manager", verbose=True)
+    configure_logging(args.verbose)
     try:
         return args.func(args)
-    except OdooAuthError as exc:
+    except HQError as exc:
         log.error("%s", exc)
         return 1
     except KeyboardInterrupt:

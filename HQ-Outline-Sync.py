@@ -1,112 +1,42 @@
+"""Compare the Odoo and Outline snapshots, and create the missing pages.
+
+Create-only: this never edits or renames a page that already exists.
+"""
 from __future__ import annotations
 
 import argparse
 import json
 import re
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any
 
-from hq_common import (BASE_DIR, HISTORY_DIR, OUT_DIR, add_common_arguments,
-                       env_positive_int, next_run_id, now_iso, read_env,
-                       setup_logging)
-
-SCAN_FILE = OUT_DIR / "projects_and_tasks.json"
-OUTLINE_SCAN_FILE = OUT_DIR / "outline_projects.json"
-MAPPING_FILE = OUT_DIR / "outline_mapping.json"
-LOG_FILE = OUT_DIR / "sync_log.md"
-
-DEFAULT_OUTLINE_URL = "https://atlas.axm.app"
-DEFAULT_COLLECTION_ID = "393ead77-88e3-46f3-8e16-dff19fafe1d1"
+from hq_common import (HISTORY_DIR, MAPPING_FILE, ODOO_SCAN_FILE,
+                       OUTLINE_SCAN_FILE, SYNC_LOG_FILE, HQError, OutlineClient,
+                       add_common_arguments, configure_logging, env_positive_int,
+                       get_logger, next_run_id, now_iso, outline_credentials)
 
 SECTIONS = ["Overview", "Customer Introduction", "Tasks", "Roadmap",
             "Customizations", "Scope of Work", "Meetings"]
 
 ODOO_ID_MARKER = "odoo-project-id"
 DUPLICATE_THRESHOLD = 0.34
+PREVIEW_ROWS = 12
 
 STOPWORDS = {"the", "inc", "llc", "ltd", "co", "gmbh", "bv", "srl", "corp",
              "company", "odoo", "implementation", "project", "and", "of", "for",
              "v17", "v18", "v19", "pvt", "limited"}
 
-log = setup_logging("outline-sync")
+log = get_logger("outline-sync")
 
 
-class SyncError(RuntimeError):
+class SyncError(HQError):
     pass
 
 
-def outline_credentials() -> tuple[str, str, str]:
-    env = read_env()
-    key = (env.get("OUTLINE_API_KEY") or env.get("Outline API Key")
-           or env.get("OUTLINE_TOKEN") or "").strip()
-    if not key:
-        env_path = BASE_DIR / ".env"
-        blob = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
-        found = re.search(r"(ol_api_[A-Za-z0-9]+)", blob)
-        key = found.group(1) if found else ""
-    if not key:
-        raise SyncError("No Outline API key found. Add OUTLINE_API_KEY=... to .env")
-    url = (env.get("OUTLINE_URL") or DEFAULT_OUTLINE_URL).strip().rstrip("/")
-    collection = (env.get("OUTLINE_COLLECTION_ID") or DEFAULT_COLLECTION_ID).strip()
-    return url, key, collection
-
-
-class OutlineClient:
-    def __init__(self, url: str, api_key: str) -> None:
-        self.url = url
-        self.api_key = api_key
-
-    def call(self, endpoint: str, payload: dict | None = None, timeout: int = 60,
-             attempts: int = 4) -> dict:
-        body = json.dumps(payload or {}).encode()
-        for attempt in range(1, attempts + 1):
-            request = urllib.request.Request(
-                f"{self.url}/api/{endpoint}", data=body,
-                headers={"Content-Type": "application/json",
-                         "Accept": "application/json",
-                         "Authorization": f"Bearer {self.api_key}"})
-            try:
-                with urllib.request.urlopen(request, timeout=timeout) as response:
-                    return json.loads(response.read().decode("utf-8", "replace"))
-            except urllib.error.HTTPError as exc:
-                detail = exc.read()[:400].decode("utf-8", "replace")
-                if exc.code == 429 and attempt < attempts:
-                    wait = float(exc.headers.get("Retry-After") or 2 ** attempt)
-                    log.warning("rate limited on %s, waiting %.0fs", endpoint, wait)
-                    time.sleep(wait)
-                    continue
-                raise SyncError(
-                    f"Outline HTTP {exc.code} on {endpoint}: {detail}") from exc
-            except urllib.error.URLError as exc:
-                if attempt < attempts:
-                    log.warning("%s unreachable (%s), retrying", endpoint, exc.reason)
-                    time.sleep(2 ** attempt)
-                    continue
-                raise SyncError(f"Cannot reach {self.url}: {exc.reason}") from exc
-        raise SyncError(f"{endpoint} failed after {attempts} attempts")
-
-    def whoami(self) -> dict:
-        return self.call("auth.info").get("data") or {}
-
-    def collection_tree(self, collection_id: str) -> list[dict]:
-        return self.call("collections.documents", {"id": collection_id}).get("data") or []
-
-    def create_document(self, title: str, text: str, collection_id: str,
-                        parent_id: str | None = None) -> dict:
-        payload: dict[str, Any] = {"title": title, "text": text,
-                                   "collectionId": collection_id, "publish": True}
-        if parent_id:
-            payload["parentDocumentId"] = parent_id
-        created = self.call("documents.create", payload).get("data") or {}
-        if not created.get("id"):
-            raise SyncError(f"Outline returned no document id for {title!r}")
-        return created
-
-
 def normalize_title(title: str) -> str:
+    """Drop the S00xxx sale-order prefix and punctuation, so the two systems'
+    names for the same client can be compared."""
     without_order = re.sub(r"^S\d{4,6}\s*-\s*", "", str(title or "")).strip()
     return re.sub(r"[^a-z0-9]+", " ", without_order.lower()).strip()
 
@@ -130,7 +60,7 @@ def nearest_titles(name: str, titles: list[str],
     return [pair for pair in scored[:count] if pair[0] > 0]
 
 
-def load_scan(path: Path = SCAN_FILE) -> dict:
+def load_scan(path: Path = ODOO_SCAN_FILE) -> dict:
     if not path.exists():
         raise SyncError(f"No Odoo scan at {path}\n"
                         "Run first:  python HQ-Scanner.py scan --practice Odoo")
@@ -157,31 +87,58 @@ def save_mapping(mapping: dict, path: Path = MAPPING_FILE) -> None:
     path.write_text(json.dumps(mapping, indent=2, default=str), encoding="utf-8")
 
 
-def append_sync_log(lines: list[str], path: Path = LOG_FILE) -> None:
+def append_sync_log(lines: list[str], path: Path = SYNC_LOG_FILE) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     header = "" if path.exists() else "# Outline sync log\n\n"
     with path.open("a", encoding="utf-8") as handle:
         handle.write(header + "\n".join(lines) + "\n")
 
 
-def compare(odoo_scan: dict, outline_snapshot: dict, mapping: dict) -> dict:
-    pages = outline_snapshot.get("projects") or []
+_reported_collisions: set[str] = set()
+
+
+def index_pages(pages: list[dict]) -> tuple[dict, dict, dict]:
+    """Index the Outline pages by odoo id marker, document id, and title.
+
+    compare() runs more than once per pipeline run, so a title collision is
+    reported only the first time it is seen.
+    """
     by_marker = {page["odoo_project_id"]: page for page in pages
                  if page.get("odoo_project_id")}
     by_document_id = {page["id"]: page for page in pages}
-
     by_title: dict[str, dict] = {}
     for page in pages:
         key = normalize_title(page.get("title") or "")
         if not key:
             log.debug("Outline page %s has an empty title, skipped for matching",
                       page.get("id"))
-            continue
-        if key in by_title:
-            log.warning("two Outline pages normalize to the same title %r: %r and %r",
-                        key, by_title[key].get("title"), page.get("title"))
-            continue
-        by_title[key] = page
+        elif key in by_title:
+            if key not in _reported_collisions:
+                _reported_collisions.add(key)
+                log.warning("two Outline pages normalize to %r: %r and %r", key,
+                            by_title[key].get("title"), page.get("title"))
+        else:
+            by_title[key] = page
+    return by_marker, by_document_id, by_title
+
+
+def find_page(project: dict, by_marker: dict, by_document_id: dict,
+              by_title: dict, mapped: dict) -> tuple[dict | None, str]:
+    """The Outline page for an Odoo project, and how it was matched."""
+    page = by_marker.get(project["id"])
+    if page:
+        return page, "marker"
+    entry = mapped.get(str(project["id"]))
+    if entry:
+        page = by_document_id.get(entry.get("id"))
+        if page:
+            return page, "mapping"
+    return by_title.get(normalize_title(project.get("name") or "")), "title"
+
+
+def compare(odoo_scan: dict, outline_snapshot: dict, mapping: dict) -> dict:
+    pages = outline_snapshot.get("projects") or []
+    by_marker, by_document_id, by_title = index_pages(pages)
     all_titles = [str(page.get("title") or "") for page in pages]
     mapped = mapping.get("projects") or {}
 
@@ -189,13 +146,7 @@ def compare(odoo_scan: dict, outline_snapshot: dict, mapping: dict) -> dict:
     claimed: set[str] = set()
 
     for project in odoo_scan.get("projects") or []:
-        page, how = by_marker.get(project["id"]), "marker"
-        if not page and str(project["id"]) in mapped:
-            page = by_document_id.get(mapped[str(project["id"])].get("id"))
-            how = "mapping"
-        if not page:
-            page = by_title.get(normalize_title(project.get("name") or ""))
-            how = "title"
+        page, how = find_page(project, by_marker, by_document_id, by_title, mapped)
 
         if page:
             claimed.add(page["id"])
@@ -235,7 +186,9 @@ def compare(odoo_scan: dict, outline_snapshot: dict, mapping: dict) -> dict:
 
 
 def escape_cell(value: Any) -> str:
-    return str(value if value is not None else "").replace("|", r"\|").strip()
+    """One markdown table cell: no pipes, and no line breaks to split the row."""
+    text = str(value if value is not None else "")
+    return re.sub(r"\s+", " ", text.replace("|", r"\|")).strip()
 
 
 def tasks_markdown(project: dict) -> str:
@@ -267,25 +220,30 @@ def project_markdown(project: dict, scan_meta: dict) -> str:
     ])
 
 
-def section_markdown(section: str, project: dict) -> str:
-    return tasks_markdown(project) if section == "Tasks" else ""
-
-
 def plan_for(project: dict, scan_meta: dict) -> dict:
+    """Everything that would be written for one project. Tasks is the only
+    section with an Odoo source; the rest are created empty for humans."""
     return {
         "odoo_id": project["id"],
         "title": project.get("name"),
         "project_body": project_markdown(project, scan_meta),
-        "sections": [{"title": section, "body": section_markdown(section, project)}
-                     for section in SECTIONS],
+        "sections": [
+            {"title": section,
+             "body": tasks_markdown(project) if section == "Tasks" else ""}
+            for section in SECTIONS
+        ],
         "task_count": len(project.get("tasks") or []),
     }
 
 
 def create_project_page(client: OutlineClient, collection_id: str, plan: dict) -> dict:
+    """Create the project page and its section pages.
+
+    Outline inserts every new sibling at the top, so the sections are created
+    in reverse to land in the intended order.
+    """
     parent = client.create_document(plan["title"], plan["project_body"], collection_id)
     created = []
-    # Outline puts each new sibling at the top, so create in reverse to land in order.
     for section in reversed(plan["sections"]):
         child = client.create_document(section["title"], section["body"],
                                        collection_id, parent["id"])
@@ -299,7 +257,8 @@ def create_project_page(client: OutlineClient, collection_id: str, plan: dict) -
 def live_titles(client: OutlineClient, collection_id: str) -> list[dict]:
     """Current top-level pages, fetched fresh in one call for the write-time guard."""
     return [{"id": node.get("id"), "title": str(node.get("title") or ""),
-             "sections": [str(child.get("title")) for child in (node.get("children") or [])]}
+             "sections": [str(child.get("title"))
+                          for child in (node.get("children") or [])]}
             for node in client.collection_tree(collection_id)]
 
 
@@ -321,9 +280,6 @@ def guard_duplicate(project: dict, pages: list[dict], force: bool) -> None:
             f"No exact match, but similar Outline pages exist:\n{listed}\n"
             f"  Odoo: {project.get('name')}\n"
             "Creating now could duplicate one. Use --force if it is separate.")
-    for score, title in near:
-        log.debug("nearest existing page for %r: ~%.2f %r",
-                  project.get("name"), score, title)
 
 
 def record_creation(mapping: dict, project: dict, created: dict, url: str,
@@ -339,6 +295,12 @@ def record_creation(mapping: dict, project: dict, created: dict, url: str,
     mapping["outline_url"] = url
     mapping["collection_id"] = collection
     save_mapping(mapping)
+
+
+def log_created(project: dict, created: dict, url: str, task_count: int) -> None:
+    append_sync_log([f"- {now_iso()} CREATE odoo#{project['id']} "
+                     f"{project.get('name')!r} -> {url}{created.get('url')} "
+                     f"({task_count} tasks)"])
 
 
 def resolve_cap(cli_limit: int | None) -> tuple[int | None, str | None]:
@@ -374,7 +336,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"  outline run {outline_meta.get('run_id')}  "
           f"{outline_meta.get('project_count')} project pages")
 
-    cap, source = resolve_cap(None)
+    cap, _ = resolve_cap(None)
     print(f"\n  SYNC_CAP: {cap if cap is not None else 'unset (no cap)'}")
 
     result = compare(odoo_scan, outline_snapshot, load_mapping())
@@ -482,14 +444,35 @@ def cmd_sync(args: argparse.Namespace) -> int:
     log.info("creating Outline page for odoo#%s %r", project["id"], project.get("name"))
     created = create_project_page(client, collection, plan)
     record_creation(mapping, project, created, url, collection)
-    append_sync_log([f"- {now_iso()} CREATE odoo#{project['id']} "
-                     f"{project.get('name')!r} -> {url}{created.get('url')} "
-                     f"({plan['task_count']} tasks)"])
+    log_created(project, created, url, plan["task_count"])
     print(f"\n  created: {url}{created.get('url')}")
     for section in created["sections"]:
         print(f"     {section['title']:<24} {url}{section.get('url')}")
     log.info("mapping saved to %s", MAPPING_FILE)
     return 0
+
+
+def print_sync_plan(run_id: str, scan_meta: dict, outline_meta: dict, result: dict,
+                    todo: list[dict], available: int, cap: int | None,
+                    cap_source: str | None, include_probable: bool) -> None:
+    print(f"Sync run {run_id}")
+    print(f"  odoo scan run    {scan_meta.get('run_id')}")
+    print(f"  outline snapshot {outline_meta.get('run_id')}")
+    print(f"\n  {len(result['odoo_only'])} projects have no Outline page")
+    if not include_probable:
+        print(f"  {len(result['probable'])} probable duplicates excluded "
+              "(--include-probable to force)")
+    if cap is None:
+        print(f"  no cap set -- all {available} would be created")
+    else:
+        print(f"  capped at {cap} of {available} by {cap_source}")
+    print(f"\n  would create {len(todo)} project pages "
+          f"= {len(todo) * (1 + len(SECTIONS))} documents")
+    for row in todo[:PREVIEW_ROWS]:
+        print(f"     odoo#{row['odoo_id']:<6} {str(row['odoo_name'])[:42]:<44} "
+              f"{row['odoo_tasks']:>4} tasks")
+    if len(todo) > PREVIEW_ROWS:
+        print(f"     ... and {len(todo) - PREVIEW_ROWS} more")
 
 
 def cmd_sync_all(args: argparse.Namespace) -> int:
@@ -515,24 +498,9 @@ def cmd_sync_all(args: argparse.Namespace) -> int:
     if cap is not None:
         todo = todo[:cap]
 
-    print(f"Sync run {run_id}")
-    print(f"  odoo scan run    {scan_meta.get('run_id')}")
-    print(f"  outline snapshot {outline_meta.get('run_id')}")
-    print(f"\n  {len(result['odoo_only'])} projects have no Outline page")
-    if not args.include_probable:
-        print(f"  {len(result['probable'])} probable duplicates excluded "
-              "(--include-probable to force)")
-    if cap is None:
-        print(f"  no cap set -- all {available} would be created")
-    else:
-        print(f"  capped at {cap} of {available} by {cap_source}")
-    print(f"\n  would create {len(todo)} project pages "
-          f"= {len(todo) * (1 + len(SECTIONS))} documents")
-    for row in todo[:12]:
-        print(f"     odoo#{row['odoo_id']:<6} {str(row['odoo_name'])[:42]:<44} "
-              f"{row['odoo_tasks']:>4} tasks")
-    if len(todo) > 12:
-        print(f"     ... and {len(todo) - 12} more")
+    if not getattr(args, "quiet", False):
+        print_sync_plan(run_id, scan_meta, outline_meta, result, todo, available,
+                        cap, cap_source, args.include_probable)
 
     if not todo:
         print("\nNothing to do.")
@@ -556,9 +524,7 @@ def cmd_sync_all(args: argparse.Namespace) -> int:
             plan = plan_for(project, scan_meta)
             created = create_project_page(client, collection, plan)
             record_creation(mapping, project, created, url, collection)
-            append_sync_log([f"- {now_iso()} CREATE odoo#{project['id']} "
-                             f"{project.get('name')!r} -> {url}{created.get('url')} "
-                             f"({plan['task_count']} tasks)"])
+            log_created(project, created, url, plan["task_count"])
             created_records.append({
                 "odoo_id": project["id"],
                 "odoo_name": project.get("name"),
@@ -572,7 +538,7 @@ def cmd_sync_all(args: argparse.Namespace) -> int:
                           "sections": SECTIONS})
             log.info("[%d/%d] odoo#%s %s -> %s", index, len(todo), project["id"],
                      str(project.get("name"))[:40], created.get("url"))
-        except SyncError as exc:
+        except HQError as exc:
             failures.append({"odoo_id": project["id"],
                              "odoo_name": project.get("name"), "error": str(exc)})
             log.error("[%d/%d] odoo#%s failed: %s", index, len(todo), project["id"],
@@ -607,7 +573,7 @@ def cmd_sync_all(args: argparse.Namespace) -> int:
         append_sync_log([f"- {now_iso()} FAILED odoo#{f['odoo_id']}: "
                          f"{f['error'].splitlines()[0][:160]}" for f in failures])
     log.info("created %d, failed %d; run record %s",
-             len(created_records), len(failures), record_path)
+             len(created_records), len(failures), record_path.name)
     print("\n  refresh the Outline snapshot:  python Outline-Scanner.py scan")
     return 1 if failures and not created_records else 0
 
@@ -656,11 +622,10 @@ def main(argv: list[str] | None = None) -> int:
     sync_all.set_defaults(func=cmd_sync_all)
 
     args = parser.parse_args(argv)
-    if args.verbose:
-        setup_logging("outline-sync", verbose=True)
+    configure_logging(args.verbose)
     try:
         return args.func(args)
-    except SyncError as exc:
+    except HQError as exc:
         log.error("%s", exc)
         return 1
     except KeyboardInterrupt:

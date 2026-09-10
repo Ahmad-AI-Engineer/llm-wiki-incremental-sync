@@ -1,16 +1,33 @@
+"""Entry point: check the Odoo session, scan both sides, compare, then create
+the missing Atlas pages after asking.
+
+    STEP 1/5  check the Odoo session   (browser login if there is none)
+    STEP 2/5  scan Odoo                -> output/projects_and_tasks.json
+    STEP 3/5  scan Atlas               -> output/outline_projects.json
+    STEP 4/5  compare the snapshots    -> what is missing in Atlas
+    STEP 5/5  create the missing pages (only after you answer yes)
+
+Nothing is written to Atlas without a yes at the prompt, or --yes.
+"""
 from __future__ import annotations
+
 import argparse
 import importlib.util
 import json
+import sys
 from types import ModuleType
 
-from hq_common import (BASE_DIR, HISTORY_DIR, add_common_arguments, next_run_id,
-                       now_iso, setup_logging)
+from hq_common import (BASE_DIR, HISTORY_DIR, HQError, OutlineClient,
+                       add_common_arguments, configure_logging,
+                       env_positive_int, get_logger, next_run_id, now_iso,
+                       outline_credentials)
 
-log = setup_logging("pipeline")
+PREVIEW_ROWS = 5
+
+log = get_logger("pipeline")
 
 
-class PipelineError(RuntimeError):
+class PipelineError(HQError):
     pass
 
 
@@ -27,125 +44,199 @@ def load_script(filename: str) -> ModuleType:
     return module
 
 
+def step_session(credentials: ModuleType, open_browser: bool) -> dict:
+    log.info("STEP 1/5  checking the Odoo session")
+    try:
+        return credentials.ensure_session(open_browser=open_browser)
+    except HQError as exc:
+        raise PipelineError(f"Odoo login failed: {exc}") from None
+
+
 def step_odoo_scan(scanner: ModuleType, practice: str,
                    include_archived: bool) -> dict:
-    log.info("STEP 1/4  scanning Odoo")
+    log.info("STEP 2/5  scanning Odoo")
     try:
         client = scanner.OdooSessionClient.from_file()
-    except scanner.ScanError as exc:
-        raise PipelineError(f"{exc}") from None
-    try:
         return scanner.scan(client, practice=practice,
                             include_archived=include_archived)
-    except scanner.ScanError as exc:
+    except HQError as exc:
         raise PipelineError(f"Odoo scan failed: {exc}") from None
 
 
-def step_outline_scan(outline: ModuleType) -> dict:
-    log.info("STEP 2/4  scanning Outline")
+def step_atlas_scan(outline: ModuleType, step: str = "STEP 3/5") -> dict:
+    log.info("%s  scanning Atlas", step)
     try:
-        url, key, collection = outline.outline_credentials()
-        document = outline.scan(outline.OutlineClient(url, key), collection)
-    except outline.OutlineScanError as exc:
-        raise PipelineError(f"Outline scan failed: {exc}") from None
+        url, key, collection = outline_credentials()
+        document = outline.scan(OutlineClient(url, key), collection)
+    except HQError as exc:
+        raise PipelineError(f"Atlas scan failed: {exc}") from None
     return document["scan"]
 
 
 def step_compare(sync: ModuleType) -> dict:
-    log.info("STEP 3/4  comparing snapshots")
+    log.info("STEP 4/5  comparing the snapshots")
     try:
         result = sync.compare(sync.load_scan(), sync.load_outline_scan(),
                               sync.load_mapping())
-    except sync.SyncError as exc:
+    except HQError as exc:
         raise PipelineError(f"Compare failed: {exc}") from None
-    log.info("to create %d, needs review %d, drifted %d, outline-only %d",
+    log.info("missing %d, needs review %d, drifted %d, atlas-only %d",
              len(result["odoo_only"]), len(result["probable"]),
              len(result["drifted"]), len(result["outline_only"]))
     return result
 
 
-def step_sync(sync: ModuleType, apply: bool, delay: float) -> int:
-    log.info("STEP 4/4  %s Outline pages", "creating" if apply else "planning")
-    args = argparse.Namespace(dry_run=not apply, limit=None, delay=delay,
-                              include_probable=False)
+def step_create(sync: ModuleType, delay: float) -> int:
+    log.info("STEP 5/5  creating the missing Atlas pages")
+    args = argparse.Namespace(dry_run=False, limit=None, delay=delay,
+                              include_probable=False, quiet=True)
     try:
         return sync.cmd_sync_all(args)
-    except sync.SyncError as exc:
-        raise PipelineError(f"Sync failed: {exc}") from None
+    except HQError as exc:
+        raise PipelineError(f"Create failed: {exc}") from None
+
+
+def sync_cap() -> int | None:
+    try:
+        return env_positive_int("SYNC_CAP")
+    except ValueError as exc:
+        raise PipelineError(str(exc)) from None
+
+
+def report_missing(result: dict, cap: int | None) -> list[dict]:
+    """Show the first few missing projects, then the total. Returns them all."""
+    missing = sorted(result["odoo_only"], key=lambda row: -row["odoo_tasks"])
+    if not missing:
+        print("\nEverything in this practice already has an Atlas page.")
+        return missing
+
+    print("\nMissing in Atlas")
+    for row in missing[:PREVIEW_ROWS]:
+        print(f"  odoo#{row['odoo_id']:<6} {str(row['odoo_name'])[:44]:<46} "
+              f"{row['odoo_tasks']:>4} tasks")
+    if len(missing) > PREVIEW_ROWS:
+        print(f"  ... and {len(missing) - PREVIEW_ROWS} more")
+
+    print(f"\n  {len(missing)} projects need to be created in Atlas.")
+    if result["probable"]:
+        print(f"  {len(result['probable'])} more look like duplicates of existing "
+              "pages and are excluded.")
+    if cap is not None and cap < len(missing):
+        print(f"  SYNC_CAP is {cap}, so this run would create {cap} of them.")
+    return missing
+
+
+def confirm(question: str, assume_yes: bool) -> bool:
+    if assume_yes:
+        print(f"\n{question} [y/N]: y  (--yes)")
+        return True
+    if not sys.stdin.isatty():
+        print(f"\n{question}\n  Not an interactive terminal, so nothing was "
+              "created. Pass --yes to create without asking.")
+        return False
+    while True:
+        try:
+            answer = input(f"\n{question} [y/N]: ").strip().lower()
+        except EOFError:
+            return False
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no", ""):
+            return False
+        print("  Please answer y or n.")
+
+
+def write_run_record(run_id: str, args: argparse.Namespace, approved: bool,
+                     odoo_result: dict, atlas_result: dict,
+                     comparison: dict) -> None:
+    """Write the run record. Counts describe the state that was compared,
+    before any pages were created."""
+    record = {
+        "pipeline": {
+            "run_id": run_id,
+            "finished_at": now_iso(),
+            "practice": args.practice,
+            "approved": approved,
+            "skipped_scan": args.skip_scan,
+            "odoo_scan": odoo_result or None,
+            "atlas_scan": atlas_result or None,
+            "counts": {
+                "to_create": len(comparison["odoo_only"]),
+                "needs_review": len(comparison["probable"]),
+                "drifted": len(comparison["drifted"]),
+                "atlas_only": len(comparison["outline_only"]),
+                "linked": len(comparison["linked"]),
+            },
+        },
+    }
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    path = HISTORY_DIR / f"pipeline_{run_id}.json"
+    path.write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
+    log.info("pipeline run %s complete; record %s", run_id, path.name)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="main.py",
-        description="Run the whole pipeline: scan Odoo, scan Outline, compare, "
-                    "then create the missing Outline pages (capped by SYNC_CAP).")
+        description="Check the Odoo session, scan Odoo and Atlas, compare, then "
+                    "ask before creating the missing Atlas pages.")
     add_common_arguments(parser)
-    parser.add_argument("--dry-run", action="store_true",
-                        help="plan only, write nothing to Outline")
+    parser.add_argument("--yes", action="store_true",
+                        help="create the missing pages without asking")
     parser.add_argument("--practice", default="Odoo",
                         help="practice to scan (default: Odoo)")
     parser.add_argument("--include-archived", action="store_true",
                         help="include archived Odoo projects and tasks")
     parser.add_argument("--skip-scan", action="store_true",
                         help="reuse the snapshots already on disk")
+    parser.add_argument("--no-browser", action="store_true",
+                        help="do not open a browser for the Odoo login")
     parser.add_argument("--delay", type=float, default=0.3,
-                        help="seconds between Outline document creates")
+                        help="seconds between Atlas document creates")
 
     args = parser.parse_args(argv)
-    if args.verbose:
-        setup_logging("pipeline", verbose=True)
+    configure_logging(args.verbose)
 
-    apply = not args.dry_run
     run_id = next_run_id("pipeline")
-    log.info("pipeline run %s  practice=%r  mode=%s", run_id, args.practice,
-             "writing to Outline" if apply else "dry run")
+    log.info("pipeline run %s  practice=%r", run_id, args.practice)
 
     try:
+        credentials = load_script("HQ-Credentials-Manager.py")
         scanner = load_script("HQ-Scanner.py")
         outline = load_script("Outline-Scanner.py")
         sync = load_script("HQ-Outline-Sync.py")
 
+        step_session(credentials, open_browser=not args.no_browser)
+
         odoo_result: dict = {}
-        outline_result: dict = {}
+        atlas_result: dict = {}
         if args.skip_scan:
-            log.info("STEP 1-2/4  skipped, reusing snapshots on disk")
+            log.info("STEP 2-3/5  skipped, reusing the snapshots on disk")
         else:
             odoo_result = step_odoo_scan(scanner, args.practice,
                                          args.include_archived)
-            outline_result = step_outline_scan(outline)
+            atlas_result = step_atlas_scan(outline)
 
         comparison = step_compare(sync)
-        exit_code = step_sync(sync, apply, args.delay)
+        missing = report_missing(comparison, sync_cap())
 
-        if apply:
-            log.info("refreshing the Outline snapshot after writing")
-            outline_result = step_outline_scan(outline)
+        exit_code = 0
+        approved = False
+        if missing:
+            approved = confirm("Create these projects in Atlas?", args.yes)
+            if approved:
+                exit_code = step_create(sync, args.delay)
+                log.info("refreshing the Atlas snapshot after writing")
+                atlas_result = step_atlas_scan(outline, step="STEP 5/5")
+            else:
+                print("\nNothing created.")
+                log.info("declined at the prompt; nothing written to Atlas")
 
-        record = {
-            "pipeline": {
-                "run_id": run_id,
-                "finished_at": now_iso(),
-                "practice": args.practice,
-                "applied": apply,
-                "skipped_scan": args.skip_scan,
-                "odoo_scan": odoo_result or None,
-                "outline_scan": outline_result or None,
-                "counts": {
-                    "to_create": len(comparison["odoo_only"]),
-                    "needs_review": len(comparison["probable"]),
-                    "drifted": len(comparison["drifted"]),
-                    "outline_only": len(comparison["outline_only"]),
-                    "linked": len(comparison["linked"]),
-                },
-            },
-        }
-        HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-        path = HISTORY_DIR / f"pipeline_{run_id}.json"
-        path.write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
-        log.info("pipeline run %s complete; record %s", run_id, path.name)
+        write_run_record(run_id, args, approved, odoo_result, atlas_result,
+                         comparison)
         return exit_code
 
-    except PipelineError as exc:
+    except HQError as exc:
         log.error("%s", exc)
         return 1
     except KeyboardInterrupt:

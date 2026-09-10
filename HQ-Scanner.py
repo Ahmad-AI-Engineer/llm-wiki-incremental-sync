@@ -1,3 +1,4 @@
+"""Scan Odoo projects and tasks by practice, using a stored session."""
 from __future__ import annotations
 
 import argparse
@@ -8,10 +9,10 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from hq_common import (BASE_DIR, HISTORY_DIR, OUT_DIR, add_common_arguments,
-                       next_run_id, now_iso, setup_logging)
+from hq_common import (CRED_FILE, HISTORY_DIR, ODOO_SCAN_FILE, OUT_DIR, HQError,
+                       add_common_arguments, configure_logging, get_logger,
+                       next_run_id, now_iso)
 
-CRED_FILE = BASE_DIR / "credentials" / "odoo_session.json"
 USER_AGENT = "HQ-Scanner/1.0"
 
 PROJECT_SCAN_FIELDS = ["id", "name", "active", "sale_line_id"]
@@ -20,11 +21,20 @@ TASK_SCAN_FIELDS = ["id", "name", "project_id", "user_ids"]
 GENERIC_CATEGORIES = {"all", "all / saleable", "all / expenses", "all / deliveries",
                       "all / saleable / events", "goods", "services"}
 
-log = setup_logging("odoo-scanner")
+log = get_logger("odoo-scanner")
 
 
-class ScanError(RuntimeError):
+class ScanError(HQError):
     pass
+
+
+def name_of(value: Any) -> str | None:
+    """Odoo returns a many-to-one as [id, display_name]."""
+    return value[1] if isinstance(value, list) and len(value) > 1 else None
+
+
+def id_of(value: Any) -> int | None:
+    return value[0] if isinstance(value, list) and value else None
 
 
 class OdooSessionClient:
@@ -94,20 +104,20 @@ class OdooSessionClient:
                 kwargs["fields"] = fields
             page = self.call_kw(model, "search_read", [domain], kwargs)
             rows.extend(page)
-            if page:
-                log.debug("read %d %s so far", len(rows), model)
             if len(page) < take:
                 break
             offset += take
+        log.debug("read %d %s", len(rows), model)
         return rows
 
 
 def load_practices(client: OdooSessionClient, projects: list[dict]) -> dict[int, dict]:
+    """Project id -> the product category of the sale line that created it."""
     line_to_projects: dict[int, list[int]] = {}
     for project in projects:
-        line = project.get("sale_line_id")
-        if isinstance(line, list) and line:
-            line_to_projects.setdefault(line[0], []).append(project["id"])
+        line_id = id_of(project.get("sale_line_id"))
+        if line_id:
+            line_to_projects.setdefault(line_id, []).append(project["id"])
     if not line_to_projects:
         return {}
 
@@ -116,13 +126,10 @@ def load_practices(client: OdooSessionClient, projects: list[dict]) -> dict[int,
                                [["id", "in", list(line_to_projects)]],
                                fields=["id", "categ_id", "product_id"], batch=300)
     for line in lines:
-        category = line.get("categ_id")
-        category_name = category[1] if isinstance(category, list) and category else None
-        product = line.get("product_id")
-        product_name = product[1] if isinstance(product, list) and product else None
-        practice = (None if not category_name
-                    or category_name.strip().lower() in GENERIC_CATEGORIES
-                    else category_name)
+        category_name = name_of(line.get("categ_id"))
+        product_name = name_of(line.get("product_id"))
+        generic = (category_name or "").strip().lower() in GENERIC_CATEGORIES
+        practice = None if not category_name or generic else category_name
         for project_id in line_to_projects.get(line["id"], []):
             resolved[project_id] = {"practice": practice, "product": product_name,
                                     "category": category_name}
@@ -153,6 +160,60 @@ def derive_practice(project: dict, practices: dict) -> dict:
     return {"practice": None, "source": "no_sale_order", "detail": None}
 
 
+def select_projects(all_projects: list[dict], practices: dict, practice: str,
+                    limit: int | None) -> tuple[list[dict], dict[str, int]]:
+    """Projects in the wanted practice, plus the practice tally over all of them."""
+    wanted = practice.strip().lower()
+    selected: list[dict] = []
+    distribution: dict[str, int] = {}
+    for project in all_projects:
+        resolved = derive_practice(project, practices)
+        key = resolved["practice"] or f"({resolved['source']})"
+        distribution[key] = distribution.get(key, 0) + 1
+        if wanted and (resolved["practice"] or "").lower() != wanted:
+            continue
+        if limit is not None and len(selected) >= limit:
+            continue
+        selected.append({
+            "id": project["id"],
+            "name": project.get("name"),
+            "practice": resolved["practice"],
+            "practice_source": resolved["source"],
+            "practice_evidence": resolved["detail"],
+            "active": bool(project.get("active", True)),
+        })
+    return selected, distribution
+
+
+def load_tasks(client: OdooSessionClient, project_ids: list[int],
+               include_archived: bool,
+               include_subtasks: bool) -> tuple[dict[int, list[dict]], int]:
+    if not project_ids:
+        return {}, 0
+
+    domain: list[Any] = [["project_id", "in", project_ids]]
+    if include_archived:
+        domain.append(["active", "in", [True, False]])
+    if not include_subtasks:
+        domain.append(["parent_id", "=", False])
+
+    tasks = client.search_read("project.task", domain, fields=TASK_SCAN_FIELDS,
+                               batch=500)
+    user_names = load_user_names(
+        client, {uid for task in tasks for uid in (task.get("user_ids") or [])})
+
+    by_project: dict[int, list[dict]] = {}
+    for task in tasks:
+        project_id = id_of(task.get("project_id"))
+        by_project.setdefault(project_id, []).append({
+            "id": task["id"],
+            "name": task.get("name"),
+            "assignees": [user_names.get(uid) or f"user:{uid}"
+                          for uid in (task.get("user_ids") or [])],
+        })
+    return by_project, len(tasks)
+
+
 def scan(client: OdooSessionClient, practice: str = "Odoo",
          include_archived: bool = False, include_subtasks: bool = True,
          limit: int | None = None, out_dir: Path = OUT_DIR) -> dict:
@@ -163,60 +224,21 @@ def scan(client: OdooSessionClient, practice: str = "Odoo",
     domain: list[Any] = [["active", "in", [True, False]]] if include_archived else []
     all_projects = client.search_read("project.project", domain,
                                       fields=PROJECT_SCAN_FIELDS, order="name asc")
-    log.info("%d projects to classify", len(all_projects))
-
     practices = load_practices(client, all_projects)
-    log.info("resolved a practice for %d of them", len(practices))
+    log.info("%d projects, a practice resolved for %d",
+             len(all_projects), len(practices))
 
-    wanted = practice.strip().lower()
-    selected: list[dict] = []
-    distribution: dict[str, int] = {}
-    for project in all_projects:
-        resolved = derive_practice(project, practices)
-        key = resolved["practice"] or f"({resolved['source']})"
-        distribution[key] = distribution.get(key, 0) + 1
-        if wanted and (resolved["practice"] or "").lower() != wanted:
-            continue
-        selected.append({
-            "id": project["id"],
-            "name": project.get("name"),
-            "practice": resolved["practice"],
-            "practice_source": resolved["source"],
-            "practice_evidence": resolved["detail"],
-            "active": bool(project.get("active", True)),
-        })
-        if limit is not None and len(selected) >= limit:
-            break
-
-    if wanted and not selected:
+    selected, distribution = select_projects(all_projects, practices, practice, limit)
+    if practice.strip() and not selected:
         available = ", ".join(sorted(k for k in distribution if not k.startswith("(")))
         raise ScanError(f"No projects resolved to practice '{practice}'.\n"
                         f"Practices found: {available or '(none)'}")
-    log.info("%d projects in practice %r", len(selected), practice or "all")
 
-    tasks_by_project: dict[int, list[dict]] = {}
-    task_total = 0
-    if selected:
-        task_domain: list[Any] = [["project_id", "in", [p["id"] for p in selected]]]
-        if include_archived:
-            task_domain.append(["active", "in", [True, False]])
-        if not include_subtasks:
-            task_domain.append(["parent_id", "=", False])
-        tasks = client.search_read("project.task", task_domain,
-                                   fields=TASK_SCAN_FIELDS, batch=500)
-        task_total = len(tasks)
-        user_names = load_user_names(
-            client, {uid for task in tasks for uid in (task.get("user_ids") or [])})
-        for task in tasks:
-            project = task.get("project_id")
-            project_id = project[0] if isinstance(project, list) and project else None
-            tasks_by_project.setdefault(project_id, []).append({
-                "id": task["id"],
-                "name": task.get("name"),
-                "assignees": [user_names.get(uid) or f"user:{uid}"
-                              for uid in (task.get("user_ids") or [])],
-            })
-    log.info("%d tasks", task_total)
+    tasks_by_project, task_total = load_tasks(
+        client, [project["id"] for project in selected],
+        include_archived, include_subtasks)
+    log.info("%d projects in practice %r, %d tasks",
+             len(selected), practice or "all", task_total)
 
     document = {
         "scan": {
@@ -241,12 +263,13 @@ def scan(client: OdooSessionClient, practice: str = "Odoo",
         ],
     }
 
+    body = json.dumps(document, indent=2, default=str)
     out_dir.mkdir(parents=True, exist_ok=True)
-    primary = out_dir / "projects_and_tasks.json"
-    primary.write_text(json.dumps(document, indent=2, default=str), encoding="utf-8")
+    primary = out_dir / ODOO_SCAN_FILE.name
+    primary.write_text(body, encoding="utf-8")
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     archive = HISTORY_DIR / f"odoo_{run_id}.json"
-    archive.write_text(json.dumps(document, indent=2, default=str), encoding="utf-8")
+    archive.write_text(body, encoding="utf-8")
     log.info("written to %s (archived as %s)", primary.name, archive.name)
 
     return {"run_id": run_id, "practice": practice or "(all)",
@@ -357,11 +380,10 @@ def main(argv: list[str] | None = None) -> int:
     scan_parser.set_defaults(func=cmd_scan)
 
     args = parser.parse_args(argv)
-    if args.verbose:
-        setup_logging("odoo-scanner", verbose=True)
+    configure_logging(args.verbose)
     try:
         return args.func(args)
-    except ScanError as exc:
+    except HQError as exc:
         log.error("%s", exc)
         return 1
     except KeyboardInterrupt:

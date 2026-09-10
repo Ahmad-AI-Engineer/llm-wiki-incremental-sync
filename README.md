@@ -9,23 +9,48 @@ No dependencies — Python 3.11+ standard library only.
 ## Running it
 
 ```bash
-python HQ-Credentials-Manager.py login   # once, until the session expires
-python main.py                           # dry run: scan both sides, compare, plan
-python main.py --apply                   # same, then create pages (honours SYNC_CAP)
+python main.py
 ```
 
-`main.py` is the entry point and runs all four steps in one process:
+That is the whole thing. It runs five steps in one process:
 
 ```
-STEP 1/4  scan Odoo     -> output/projects_and_tasks.json
-STEP 2/4  scan Outline  -> output/outline_projects.json
-STEP 3/4  compare snapshots
-STEP 4/4  create the missing Outline pages   (--apply only)
+STEP 1/5  check the Odoo session   (opens the browser to log in if there is none)
+STEP 2/5  scan Odoo     -> output/projects_and_tasks.json
+STEP 3/5  scan Atlas    -> output/outline_projects.json
+STEP 4/5  compare the snapshots
+STEP 5/5  create the missing Atlas pages   (only after you answer yes)
 ```
 
-With `--apply` it re-scans Outline afterwards, so the snapshot reflects what it
-just created. Useful flags: `--skip-scan` (reuse snapshots on disk),
-`--practice X`, `--include-archived`, `--delay`, `-v`.
+Step 1 validates the stored `session_id` against Odoo. If the file is missing,
+empty or the session has expired, it serves the login page at
+`127.0.0.1:8765`, opens a browser, and waits. On success it writes
+`credentials/odoo_session.json` and carries on — no restart needed.
+
+Step 4 prints the first few projects that have no Atlas page, then the total,
+then asks:
+
+```
+Missing in Atlas
+  odoo#377    S00258 - 12panel Upgrdation V17                 229 tasks
+  odoo#205    S00111 - The Seating Shoppe, Luzy Stein         221 tasks
+  ... and 231 more
+
+  236 projects need to be created in Atlas.
+  47 more look like duplicates of existing pages and are excluded.
+  SYNC_CAP is 4, so this run would create 4 of them.
+
+Create these projects in Atlas? [y/N]:
+```
+
+Answering `n` (or just Enter) terminates without writing anything. Answering
+`y` creates the pages and re-scans Atlas so the snapshot reflects them.
+
+Nothing reaches Atlas without a `y`. Piped or scheduled runs are not
+interactive, so they refuse to create unless you pass `--yes`.
+
+Useful flags: `--yes` (skip the prompt), `--skip-scan` (reuse the snapshots on
+disk), `--no-browser`, `--practice X`, `--include-archived`, `--delay`, `-v`.
 
 Each run writes `output/history/pipeline_<run_id>.json` recording the mode, the
 scan run ids it used, and the resulting counts.
@@ -42,14 +67,17 @@ for one-off work.
 | `HQ-Scanner.py` | Odoo → `output/projects_and_tasks.json` |
 | `Outline-Scanner.py` | Outline → `output/outline_projects.json` |
 | `HQ-Outline-Sync.py` | compare the two snapshots, create Outline pages |
-| `hq_common.py` | shared env loading, run ids, logging |
+| `hq_common.py` | shared paths, env loading, run ids, logging, Outline client |
+| `ui/` | the browser login page (`login.html`, `login.css`) |
 
 Both sides produce a snapshot on disk, so comparison is reproducible and needs
 no API access.
 
 `hq_common.py` exists because the four scripts have hyphens in their names,
 which are not valid Python module names — so they cannot import each other.
-It holds the logic that would otherwise be copied four times.
+It holds the logic that would otherwise be copied four times: the output paths,
+the `HQError` base class every script reports through, `.env` loading, run ids,
+logging, and the `OutlineClient`.
 
 ## Run ids, file naming and logging
 
@@ -66,9 +94,13 @@ continue correctly across restarts. Each sync record names the exact Odoo and
 Outline run ids it compared.
 
 Logging uses the standard `logging` module: console at INFO (`-v` for DEBUG,
-or `LOG_LEVEL` in `.env`) and a full DEBUG trail in
+or `LOG_LEVEL` in `.env`; `-v` wins) and a full DEBUG trail in
 `output/logs/pipeline.log`, rotating at 5 MB with 3 backups. Reports go to
 stdout; logs go to stderr, so `command > report.txt` keeps them separate.
+
+Console output is forced to UTF-8. Some project names carry characters a
+Windows cp1252 console cannot encode, which otherwise aborts a report
+part-way through.
 
 ## The sync cap
 
@@ -85,12 +117,19 @@ disabling the cap.
 
 ## 1. Authenticate
 
+`main.py` does this for you when it needs to. These are for doing it by hand:
+
 ```bash
 python HQ-Credentials-Manager.py ui       # browser form at 127.0.0.1:8765
 python HQ-Credentials-Manager.py login    # terminal, hidden password
 python HQ-Credentials-Manager.py status   # validate the stored token
 python HQ-Credentials-Manager.py logout
 ```
+
+The login page asks only for a username and password. The server it signs in
+to is fixed by `ODOO_URL` in `.env` and shown on the page, so a run can never
+point at the wrong Odoo by mistake. Its markup lives in `ui/`, not in the
+Python.
 
 Odoo issues no OAuth token for username/password login — it issues a
 `session_id` cookie, and that is what gets stored in
