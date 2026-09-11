@@ -1,19 +1,13 @@
-"""Scan Odoo projects and tasks by practice, using a stored session."""
 from __future__ import annotations
 
 import argparse
 import json
-import ssl
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any
 
-from hq_common import (CRED_FILE, HISTORY_DIR, ODOO_SCAN_FILE, OUT_DIR, HQError,
-                       add_common_arguments, configure_logging, get_logger,
-                       next_run_id, now_iso)
-
-USER_AGENT = "HQ-Scanner/1.0"
+from hq_common import (HISTORY_DIR, ODOO_SCAN_FILE, OUT_DIR, HQError,
+                       OdooSessionClient, add_common_arguments,
+                       configure_logging, get_logger, next_run_id, now_iso)
 
 PROJECT_SCAN_FIELDS = ["id", "name", "active", "sale_line_id"]
 TASK_SCAN_FIELDS = ["id", "name", "project_id", "user_ids"]
@@ -29,7 +23,6 @@ class ScanError(HQError):
 
 
 def name_of(value: Any) -> str | None:
-    """Odoo returns a many-to-one as [id, display_name]."""
     return value[1] if isinstance(value, list) and len(value) > 1 else None
 
 
@@ -37,82 +30,7 @@ def id_of(value: Any) -> int | None:
     return value[0] if isinstance(value, list) and value else None
 
 
-class OdooSessionClient:
-    def __init__(self, credentials: dict) -> None:
-        self.url = credentials["odoo_url"].rstrip("/")
-        self.session_id = credentials["session_id"]
-        self.db = credentials.get("db")
-        self.uid = credentials.get("uid")
-        self.username = credentials.get("username")
-        self.name = credentials.get("name")
-        self.server_version = credentials.get("server_version")
-        self.verify_ssl = credentials.get("verify_ssl", True)
-
-    @classmethod
-    def from_file(cls, path: Path = CRED_FILE) -> "OdooSessionClient":
-        if not path.exists():
-            raise ScanError(
-                f"No stored session at {path}\n"
-                "Authenticate first:  python HQ-Credentials-Manager.py ui")
-        return cls(json.loads(path.read_text(encoding="utf-8")))
-
-    def call_kw(self, model: str, method: str, args: list,
-                kwargs: dict | None = None, timeout: int = 180) -> Any:
-        payload = json.dumps({"jsonrpc": "2.0", "method": "call", "params": {
-            "model": model, "method": method, "args": args, "kwargs": kwargs or {},
-        }}).encode()
-        request = urllib.request.Request(
-            self.url + "/web/dataset/call_kw", data=payload, headers={
-                "Content-Type": "application/json",
-                "User-Agent": USER_AGENT,
-                "Cookie": f"session_id={self.session_id}",
-                "X-Openerp-Session-Id": self.session_id,
-            })
-        context = None if self.verify_ssl else ssl._create_unverified_context()
-        try:
-            with urllib.request.urlopen(request, timeout=timeout,
-                                        context=context) as response:
-                body = json.loads(response.read().decode("utf-8", "replace"))
-        except urllib.error.HTTPError as exc:
-            raise ScanError(f"HTTP {exc.code} calling {model}.{method}: "
-                            f"{exc.reason}") from exc
-        except urllib.error.URLError as exc:
-            raise ScanError(f"Cannot reach {self.url}: {exc.reason}") from exc
-
-        if "error" in body:
-            data = body["error"].get("data") or {}
-            name = data.get("name", "")
-            message = str(data.get("message")
-                          or body["error"].get("message") or "").strip()
-            if "SessionExpired" in name or "Session expired" in message:
-                raise ScanError("The stored session has expired. Re-authenticate:\n"
-                                "  python HQ-Credentials-Manager.py ui")
-            raise ScanError(f"{name or 'OdooError'} on {model}.{method}: {message}")
-        return body.get("result")
-
-    def search_read(self, model: str, domain: list, fields: list[str] | None = None,
-                    order: str = "id asc", batch: int = 200,
-                    limit: int | None = None) -> list[dict]:
-        rows: list[dict] = []
-        offset = 0
-        while True:
-            take = batch if limit is None else min(batch, limit - len(rows))
-            if take <= 0:
-                break
-            kwargs: dict[str, Any] = {"offset": offset, "limit": take, "order": order}
-            if fields:
-                kwargs["fields"] = fields
-            page = self.call_kw(model, "search_read", [domain], kwargs)
-            rows.extend(page)
-            if len(page) < take:
-                break
-            offset += take
-        log.debug("read %d %s", len(rows), model)
-        return rows
-
-
 def load_practices(client: OdooSessionClient, projects: list[dict]) -> dict[int, dict]:
-    """Project id -> the product category of the sale line that created it."""
     line_to_projects: dict[int, list[int]] = {}
     for project in projects:
         line_id = id_of(project.get("sale_line_id"))
@@ -126,60 +44,54 @@ def load_practices(client: OdooSessionClient, projects: list[dict]) -> dict[int,
                                [["id", "in", list(line_to_projects)]],
                                fields=["id", "categ_id", "product_id"], batch=300)
     for line in lines:
-        category_name = name_of(line.get("categ_id"))
-        product_name = name_of(line.get("product_id"))
-        generic = (category_name or "").strip().lower() in GENERIC_CATEGORIES
-        practice = None if not category_name or generic else category_name
+        category = name_of(line.get("categ_id"))
+        if not category or category.strip().lower() in GENERIC_CATEGORIES:
+            continue
         for project_id in line_to_projects.get(line["id"], []):
-            resolved[project_id] = {"practice": practice, "product": product_name,
-                                    "category": category_name}
+            resolved[project_id] = {"practice": category,
+                                    "product": name_of(line.get("product_id"))}
     missing = len(line_to_projects) - len(lines)
-    if missing > 0:
-        log.warning("%d sale order line(s) referenced by projects could not be read "
-                    "(deleted, or hidden by a record rule)", missing)
+    if missing:
+        log.warning("%d sale order line(s) could not be read (deleted, or hidden "
+                    "by a record rule)", missing)
     return resolved
 
 
 def load_user_names(client: OdooSessionClient, user_ids: set[int]) -> dict[int, str]:
     if not user_ids:
         return {}
-    rows = client.search_read("res.users", [["id", "in", sorted(user_ids)]],
+    rows = client.search_read("res.users",
+                              [["id", "in", sorted(user_ids)],
+                               ["active", "in", [True, False]]],
                               fields=["id", "name"], batch=300)
-    return {row["id"]: row.get("name") for row in rows}
-
-
-def derive_practice(project: dict, practices: dict) -> dict:
-    entry = practices.get(project["id"])
-    if entry and entry.get("practice"):
-        return {"practice": entry["practice"], "source": "product_category",
-                "detail": entry.get("product")}
-    if entry and entry.get("product"):
-        return {"practice": None, "source": "uncategorized_product",
-                "detail": f"{entry['product']} [category: "
-                          f"{entry.get('category') or 'none'}]"}
-    return {"practice": None, "source": "no_sale_order", "detail": None}
+    names = {row["id"]: row.get("name") for row in rows}
+    missing = len(user_ids) - len(names)
+    if missing:
+        log.warning("%d assignee(s) could not be named and will show as user:<id>",
+                    missing)
+    return names
 
 
 def select_projects(all_projects: list[dict], practices: dict, practice: str,
                     limit: int | None) -> tuple[list[dict], dict[str, int]]:
-    """Projects in the wanted practice, plus the practice tally over all of them."""
     wanted = practice.strip().lower()
     selected: list[dict] = []
     distribution: dict[str, int] = {}
     for project in all_projects:
-        resolved = derive_practice(project, practices)
-        key = resolved["practice"] or f"({resolved['source']})"
-        distribution[key] = distribution.get(key, 0) + 1
-        if wanted and (resolved["practice"] or "").lower() != wanted:
+        entry = practices.get(project["id"])
+        if not entry:
+            continue
+        name = entry["practice"]
+        distribution[name] = distribution.get(name, 0) + 1
+        if wanted and name.lower() != wanted:
             continue
         if limit is not None and len(selected) >= limit:
             continue
         selected.append({
             "id": project["id"],
             "name": project.get("name"),
-            "practice": resolved["practice"],
-            "practice_source": resolved["source"],
-            "practice_evidence": resolved["detail"],
+            "practice": name,
+            "practice_evidence": entry["product"],
             "active": bool(project.get("active", True)),
         })
     return selected, distribution
@@ -225,20 +137,19 @@ def scan(client: OdooSessionClient, practice: str = "Odoo",
     all_projects = client.search_read("project.project", domain,
                                       fields=PROJECT_SCAN_FIELDS, order="name asc")
     practices = load_practices(client, all_projects)
-    log.info("%d projects, a practice resolved for %d",
-             len(all_projects), len(practices))
-
     selected, distribution = select_projects(all_projects, practices, practice, limit)
-    if practice.strip() and not selected:
-        available = ", ".join(sorted(k for k in distribution if not k.startswith("(")))
-        raise ScanError(f"No projects resolved to practice '{practice}'.\n"
-                        f"Practices found: {available or '(none)'}")
+    if not selected:
+        if not practices:
+            raise ScanError("No customer projects found: no project has a sale "
+                            "order line in a practice category.")
+        raise ScanError(f"No customer projects in practice '{practice}'.\n"
+                        f"Practices found: {', '.join(sorted(distribution))}")
+    log.info("%d projects, %d for customers, %d in practice %r",
+             len(all_projects), len(practices), len(selected), practice or "any")
 
     tasks_by_project, task_total = load_tasks(
         client, [project["id"] for project in selected],
         include_archived, include_subtasks)
-    log.info("%d projects in practice %r, %d tasks",
-             len(selected), practice or "all", task_total)
 
     document = {
         "scan": {
@@ -252,9 +163,11 @@ def scan(client: OdooSessionClient, practice: str = "Odoo",
             "practice_derived_from": "project.sale_line_id -> sale.order.line.categ_id",
             "include_archived": include_archived,
             "include_subtasks": include_subtasks,
+            "projects_examined": len(all_projects),
+            "customer_project_count": len(practices),
             "project_count": len(selected),
             "task_count": task_total,
-            "practice_distribution_all_projects": dict(
+            "practice_distribution": dict(
                 sorted(distribution.items(), key=lambda kv: -kv[1])),
         },
         "projects": [
@@ -270,7 +183,8 @@ def scan(client: OdooSessionClient, practice: str = "Odoo",
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     archive = HISTORY_DIR / f"odoo_{run_id}.json"
     archive.write_text(body, encoding="utf-8")
-    log.info("written to %s (archived as %s)", primary.name, archive.name)
+    log.info("%d tasks; written to %s (archived as %s)",
+             task_total, primary.name, archive.name)
 
     return {"run_id": run_id, "practice": practice or "(all)",
             "projects": len(selected), "tasks": task_total,
@@ -283,30 +197,17 @@ def practice_overview(client: OdooSessionClient) -> str:
     practices = load_practices(client, projects)
 
     tally: dict[str, int] = {}
-    sources: dict[str, int] = {}
-    uncategorized: dict[str, int] = {}
-    for project in projects:
-        resolved = derive_practice(project, practices)
-        key = resolved["practice"] or "(no practice)"
-        tally[key] = tally.get(key, 0) + 1
-        sources[resolved["source"]] = sources.get(resolved["source"], 0) + 1
-        if resolved["source"] == "uncategorized_product" and resolved["detail"]:
-            uncategorized[resolved["detail"]] = uncategorized.get(
-                resolved["detail"], 0) + 1
+    for entry in practices.values():
+        tally[entry["practice"]] = tally.get(entry["practice"], 0) + 1
 
-    lines = [f"Practices over {len(projects)} projects",
+    lines = [f"Customer practices over {len(projects)} projects",
              "(product category on the project's sale order line: "
              "project.sale_line_id -> sale.order.line.categ_id)", ""]
     for name, count in sorted(tally.items(), key=lambda kv: -kv[1]):
         lines.append(f"  {count:>5}  {name}")
     lines.append("")
-    lines.append("Resolved via: " + ", ".join(
-        f"{k}={v}" for k, v in sorted(sources.items(), key=lambda kv: -kv[1])))
-    if uncategorized:
-        lines.append("")
-        lines.append("Sold products in a catch-all category (no practice):")
-        for name, count in sorted(uncategorized.items(), key=lambda kv: -kv[1]):
-            lines.append(f"  {count:>5}  {name}")
+    lines.append(f"  {len(projects) - len(practices)} internal projects have no "
+                 "practice and are out of scope")
     return "\n".join(lines)
 
 
@@ -322,11 +223,14 @@ def practice_of(client: OdooSessionClient, query: str) -> str:
     practices = load_practices(client, projects)
     lines = [f"{len(projects)} project(s) matching '{query}':", ""]
     for project in projects:
-        resolved = derive_practice(project, practices)
+        entry = practices.get(project["id"])
         archived = "" if project.get("active", True) else "  (archived)"
         lines.append(f"  #{project['id']}  {project.get('name')}{archived}")
-        lines.append(f"      practice: {resolved['practice'] or '(none)'}")
-        lines.append(f"      from:     {resolved['source']}  {resolved['detail'] or ''}")
+        if entry:
+            lines.append(f"      practice: {entry['practice']}")
+            lines.append(f"      sold as:  {entry['product'] or '-'}")
+        else:
+            lines.append("      practice: none, internal project, out of scope")
     return "\n".join(lines)
 
 

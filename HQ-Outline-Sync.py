@@ -1,7 +1,3 @@
-"""Compare the Odoo and Outline snapshots, and create the missing pages.
-
-Create-only: this never edits or renames a page that already exists.
-"""
 from __future__ import annotations
 
 import argparse
@@ -12,12 +8,16 @@ from pathlib import Path
 from typing import Any
 
 from hq_common import (HISTORY_DIR, MAPPING_FILE, ODOO_SCAN_FILE,
-                       OUTLINE_SCAN_FILE, SYNC_LOG_FILE, HQError, OutlineClient,
-                       add_common_arguments, configure_logging, env_positive_int,
-                       get_logger, next_run_id, now_iso, outline_credentials)
+                       OUTLINE_SCAN_FILE, SYNC_LOG_FILE, TASK_SECTION_TITLES,
+                       TITLE_LIMIT, HQError,
+                       OdooSessionClient, OutlineClient, add_common_arguments,
+                       clean_title, configure_logging, env_positive_int,
+                       get_logger, load_task_descriptions, next_run_id, now_iso,
+                       outline_credentials)
+
 
 SECTIONS = ["Overview", "Customer Introduction", "Tasks", "Roadmap",
-            "Customizations", "Scope of Work", "Meetings"]
+            "Customizations", "Scope of Work", "Meetings", "Case Studies"]
 
 ODOO_ID_MARKER = "odoo-project-id"
 DUPLICATE_THRESHOLD = 0.34
@@ -35,8 +35,6 @@ class SyncError(HQError):
 
 
 def normalize_title(title: str) -> str:
-    """Drop the S00xxx sale-order prefix and punctuation, so the two systems'
-    names for the same client can be compared."""
     without_order = re.sub(r"^S\d{4,6}\s*-\s*", "", str(title or "")).strip()
     return re.sub(r"[^a-z0-9]+", " ", without_order.lower()).strip()
 
@@ -69,7 +67,7 @@ def load_scan(path: Path = ODOO_SCAN_FILE) -> dict:
 
 def load_outline_scan(path: Path = OUTLINE_SCAN_FILE) -> dict:
     if not path.exists():
-        raise SyncError(f"No Outline snapshot at {path}\n"
+        raise SyncError(f"No Atlas snapshot at {path}\n"
                         "Run first:  python Outline-Scanner.py scan")
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -98,11 +96,6 @@ _reported_collisions: set[str] = set()
 
 
 def index_pages(pages: list[dict]) -> tuple[dict, dict, dict]:
-    """Index the Outline pages by odoo id marker, document id, and title.
-
-    compare() runs more than once per pipeline run, so a title collision is
-    reported only the first time it is seen.
-    """
     by_marker = {page["odoo_project_id"]: page for page in pages
                  if page.get("odoo_project_id")}
     by_document_id = {page["id"]: page for page in pages}
@@ -110,12 +103,12 @@ def index_pages(pages: list[dict]) -> tuple[dict, dict, dict]:
     for page in pages:
         key = normalize_title(page.get("title") or "")
         if not key:
-            log.debug("Outline page %s has an empty title, skipped for matching",
+            log.debug("atlas page %s has an empty title, skipped for matching",
                       page.get("id"))
         elif key in by_title:
             if key not in _reported_collisions:
                 _reported_collisions.add(key)
-                log.warning("two Outline pages normalize to %r: %r and %r", key,
+                log.warning("two atlas pages normalize to %r: %r and %r", key,
                             by_title[key].get("title"), page.get("title"))
         else:
             by_title[key] = page
@@ -124,7 +117,6 @@ def index_pages(pages: list[dict]) -> tuple[dict, dict, dict]:
 
 def find_page(project: dict, by_marker: dict, by_document_id: dict,
               by_title: dict, mapped: dict) -> tuple[dict | None, str]:
-    """The Outline page for an Odoo project, and how it was matched."""
     page = by_marker.get(project["id"])
     if page:
         return page, "marker"
@@ -153,6 +145,7 @@ def compare(odoo_scan: dict, outline_snapshot: dict, mapping: dict) -> dict:
             record = {
                 "odoo_id": project["id"],
                 "odoo_name": project.get("name"),
+                "outline_id": page["id"],
                 "outline_title": page.get("title"),
                 "outline_url": page.get("url"),
                 "how": how,
@@ -185,23 +178,34 @@ def compare(odoo_scan: dict, outline_snapshot: dict, mapping: dict) -> dict:
             "odoo_only": odoo_only, "outline_only": outline_only, "drifted": drifted}
 
 
+TASK_TITLE_PATTERN = re.compile(r"^\s*(\d+)\s*-\s")
+
+
+def task_title(task_id: int, name: Any) -> str:
+    prefix = f"{task_id} - "
+    body = clean_title(name, limit=TITLE_LIMIT - len(prefix))
+    return prefix + (body or "(untitled)")
+
+
+def task_id_of(title: Any) -> int | None:
+    found = TASK_TITLE_PATTERN.match(str(title or ""))
+    return int(found.group(1)) if found else None
+
+
 def escape_cell(value: Any) -> str:
-    """One markdown table cell: no pipes, and no line breaks to split the row."""
     text = str(value if value is not None else "")
     return re.sub(r"\s+", " ", text.replace("|", r"\|")).strip()
 
 
-def tasks_markdown(project: dict) -> str:
-    tasks = project.get("tasks") or []
-    if not tasks:
-        return "_No tasks in Odoo for this project._"
-    lines = ["| Task | Assignees |", "| --- | --- |"]
-    for task in tasks:
-        who = ", ".join(task.get("assignees") or []) or "—"
-        lines.append(f"| {escape_cell(task.get('name'))} | {escape_cell(who)} |")
-    lines.append("")
-    lines.append(f"_{len(tasks)} task(s) from Odoo._")
-    return "\n".join(lines)
+def task_page_markdown(task: dict, description: str) -> str:
+    who = ", ".join(task.get("assignees") or [])
+    parts = [f"_Assigned to: {who}_" if who else "_Unassigned._"]
+    full = str(task.get("full_name") or "")
+    if full and full != task.get("title"):
+        parts.append(f"**{full}**")
+    if description:
+        parts.append(description)
+    return "\n\n".join(parts)
 
 
 def project_markdown(project: dict, scan_meta: dict) -> str:
@@ -221,27 +225,41 @@ def project_markdown(project: dict, scan_meta: dict) -> str:
 
 
 def plan_for(project: dict, scan_meta: dict) -> dict:
-    """Everything that would be written for one project. Tasks is the only
-    section with an Odoo source; the rest are created empty for humans."""
+    tasks = project.get("tasks") or []
     return {
         "odoo_id": project["id"],
-        "title": project.get("name"),
+        "title": clean_title(project.get("name")) or f"Project {project['id']}",
         "project_body": project_markdown(project, scan_meta),
-        "sections": [
-            {"title": section,
-             "body": tasks_markdown(project) if section == "Tasks" else ""}
-            for section in SECTIONS
-        ],
-        "task_count": len(project.get("tasks") or []),
+        "sections": [{"title": section, "body": ""} for section in SECTIONS],
+        "tasks": [{"id": task["id"],
+                   "title": task_title(task["id"], task.get("name")),
+                   "full_name": clean_title(task.get("name"), limit=10_000),
+                   "assignees": task.get("assignees") or []}
+                  for task in tasks],
+        "task_count": len(tasks),
     }
 
 
-def create_project_page(client: OutlineClient, collection_id: str, plan: dict) -> dict:
-    """Create the project page and its section pages.
+def create_task_pages(client: OutlineClient, odoo: OdooSessionClient,
+                      collection_id: str, tasks_document_id: str,
+                      tasks: list[dict], delay: float = 0.0) -> int:
+    if not tasks:
+        return 0
+    descriptions = load_task_descriptions(odoo, [task["id"] for task in tasks])
+    made = 0
+    for task in reversed(tasks):
+        body = task_page_markdown(task, descriptions.get(task["id"], ""))
+        client.create_document(task["title"], body, collection_id,
+                               tasks_document_id)
+        made += 1
+        if delay:
+            time.sleep(delay)
+    return made
 
-    Outline inserts every new sibling at the top, so the sections are created
-    in reverse to land in the intended order.
-    """
+
+def create_project_page(client: OutlineClient, collection_id: str, plan: dict,
+                        odoo: OdooSessionClient | None = None,
+                        delay: float = 0.0) -> dict:
     parent = client.create_document(plan["title"], plan["project_body"], collection_id)
     created = []
     for section in reversed(plan["sections"]):
@@ -250,12 +268,19 @@ def create_project_page(client: OutlineClient, collection_id: str, plan: dict) -
         created.append({"title": section["title"], "id": child["id"],
                         "url": child.get("url")})
     created.reverse()
+
+    tasks_section = next((s for s in created if s["title"] == "Tasks"), None)
+    task_pages = 0
+    if odoo is not None and tasks_section:
+        task_pages = create_task_pages(client, odoo, collection_id,
+                                       tasks_section["id"], plan["tasks"], delay)
+
     return {"document_id": parent["id"], "title": plan["title"],
-            "url": parent.get("url"), "sections": created}
+            "url": parent.get("url"), "sections": created,
+            "task_pages": task_pages}
 
 
 def live_titles(client: OutlineClient, collection_id: str) -> list[dict]:
-    """Current top-level pages, fetched fresh in one call for the write-time guard."""
     return [{"id": node.get("id"), "title": str(node.get("title") or ""),
              "sections": [str(child.get("title"))
                           for child in (node.get("children") or [])]}
@@ -263,21 +288,20 @@ def live_titles(client: OutlineClient, collection_id: str) -> list[dict]:
 
 
 def guard_duplicate(project: dict, pages: list[dict], force: bool) -> None:
-    """Refuse to create when the live collection already has this project."""
     wanted = normalize_title(project.get("name") or "")
     exact = next((p for p in pages if normalize_title(p["title"]) == wanted), None)
     if exact and not force:
         raise SyncError(
-            f"An Outline page already matches this project:\n"
+            f"An Atlas page already matches this project:\n"
             f"  Odoo:    {project.get('name')}\n"
-            f"  Outline: {exact['title']} (sections: {exact['sections']})\n"
+            f"  Atlas: {exact['title']} (sections: {exact['sections']})\n"
             "Create-only mode will not touch it. Use --force to create anyway.")
 
     near = nearest_titles(project.get("name") or "", [p["title"] for p in pages])
     if near and near[0][0] >= DUPLICATE_THRESHOLD and not force:
         listed = "\n".join(f"    ~{score:.2f}  {title}" for score, title in near)
         raise SyncError(
-            f"No exact match, but similar Outline pages exist:\n{listed}\n"
+            f"No exact match, but similar Atlas pages exist:\n{listed}\n"
             f"  Odoo: {project.get('name')}\n"
             "Creating now could duplicate one. Use --force if it is separate.")
 
@@ -303,8 +327,56 @@ def log_created(project: dict, created: dict, url: str, task_count: int) -> None
                      f"({task_count} tasks)"])
 
 
+def tree_index(client: OutlineClient, collection_id: str) -> dict[str, dict]:
+    index: dict[str, dict] = {}
+
+    def walk(nodes):
+        for node in nodes:
+            index[node.get("id")] = node
+            walk(node.get("children") or [])
+
+    walk(client.collection_tree(collection_id))
+    return index
+
+
+def tasks_section_of(page: dict) -> dict | None:
+    for child in page.get("children") or []:
+        if str(child.get("title") or "").strip().lower() in TASK_SECTION_TITLES:
+            return child
+    return None
+
+
+def missing_tasks(tasks: list[dict], section: dict) -> list[dict]:
+    have = {task_id_of(child.get("title"))
+            for child in (section.get("children") or [])}
+    have.discard(None)
+    return [task for task in tasks if task["id"] not in have]
+
+
+def task_gaps(client: OutlineClient, rows: list[dict], projects: dict,
+              scan_meta: dict, collection_id: str) -> tuple[list[dict], list[dict]]:
+    index = tree_index(client, collection_id)
+    gaps, skipped = [], []
+    for row in rows:
+        project = projects.get(row["odoo_id"])
+        page = index.get(row["outline_id"])
+        if not project or not page:
+            skipped.append({**row, "why": "project or page not found"})
+            continue
+        section = tasks_section_of(page)
+        if section is None:
+            skipped.append({**row, "why": "no Tasks section on the page"})
+            continue
+        plan = plan_for(project, scan_meta)
+        absent = missing_tasks(plan["tasks"], section)
+        if absent:
+            gaps.append({"row": row, "section_id": section["id"],
+                         "present": len(section.get("children") or []),
+                         "tasks": absent})
+    return gaps, skipped
+
+
 def resolve_cap(cli_limit: int | None) -> tuple[int | None, str | None]:
-    """--limit wins over SYNC_CAP; 0 is a real value meaning create nothing."""
     if cli_limit is not None:
         return cli_limit, "--limit"
     try:
@@ -319,7 +391,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     client = OutlineClient(url, key)
     who = client.whoami()
     user, team = who.get("user") or {}, who.get("team") or {}
-    print(f"Outline: {team.get('name')} ({url})")
+    print(f"Atlas: {team.get('name')} ({url})")
     print(f"  authenticated as {user.get('name')} <{user.get('email')}> "
           f"role={user.get('role')}")
     pages = live_titles(client, collection)
@@ -361,12 +433,12 @@ def print_compare(result: dict, show: str, limit: int) -> None:
             print(f"  odoo#{row['odoo_id']:<6} {str(row['odoo_name'])[:32]:<34} "
                   f"~{row['score']:.2f}  {row['outline_title']}")
     if show in ("odoo-only", "all"):
-        print("\n-- in Odoo, no Outline page --")
+        print("\n-- in Odoo, no Atlas page --")
         for row in sorted(result["odoo_only"], key=lambda r: -r["odoo_tasks"])[:limit]:
             print(f"  odoo#{row['odoo_id']:<6} {str(row['odoo_name'])[:42]:<44} "
                   f"{row['odoo_tasks']:>4} tasks")
-    if show in ("outline-only", "all"):
-        print("\n-- in Outline, no Odoo-practice project --")
+    if show in ("atlas-only", "all"):
+        print("\n-- in Atlas, no Odoo customer project --")
         for row in result["outline_only"][:limit]:
             print(f"  {str(row['outline_title'])[:42]:<44} "
                   f"sections={len(row['sections']):<3} tasks={row['outline_tasks']}")
@@ -381,7 +453,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
     outline_meta = outline_snapshot.get("scan") or {}
     print(f"Odoo    run {odoo_meta.get('run_id')}  practice={odoo_meta.get('practice')}  "
           f"{odoo_meta.get('project_count')} projects, {odoo_meta.get('task_count')} tasks")
-    print(f"Outline run {outline_meta.get('run_id')}  "
+    print(f"Atlas   run {outline_meta.get('run_id')}  "
           f"{outline_meta.get('collection_name')!r}  "
           f"{outline_meta.get('project_count')} project pages")
 
@@ -389,19 +461,19 @@ def cmd_compare(args: argparse.Namespace) -> int:
     print(f"  matched by title only        : {len(result['title_matched']):>4}")
     print(f"  probable match, needs review : {len(result['probable']):>4}")
     print(f"  in Odoo only  (to create)    : {len(result['odoo_only']):>4}")
-    print(f"  in Outline only (unmatched)  : {len(result['outline_only']):>4}")
+    print(f"  in Atlas only (unmatched)    : {len(result['outline_only']):>4}")
     print(f"  matched but drifted          : {len(result['drifted']):>4}")
 
     print_compare(result, args.show, args.limit)
     if args.show == "none":
-        print("\n  (--show drift|probable|odoo-only|outline-only|all for detail)")
+        print("\n  (--show drift|probable|odoo-only|atlas-only|all for detail)")
     return 0
 
 
 def cmd_candidates(args: argparse.Namespace) -> int:
     result = compare(load_scan(), load_outline_scan(), load_mapping())
     rows = sorted(result["odoo_only"], key=lambda r: -r["odoo_tasks"])
-    print(f"{len(rows)} Odoo projects with no Outline page and no similar title:\n")
+    print(f"{len(rows)} Odoo projects with no Atlas page and no similar title:\n")
     for row in rows[:args.limit]:
         print(f"  odoo#{row['odoo_id']:<6} {str(row['odoo_name'])[:44]:<46} "
               f"{row['odoo_tasks']:>4} tasks")
@@ -424,7 +496,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
     mapping = load_mapping()
     if str(project["id"]) in mapping["projects"]:
-        raise SyncError(f"Project {project['id']} is already mapped to an Outline "
+        raise SyncError(f"Project {project['id']} is already mapped to an Atlas "
                         "document. This tool is create-only.")
 
     guard_duplicate(project, live_titles(client, collection), args.force)
@@ -432,24 +504,102 @@ def cmd_sync(args: argparse.Namespace) -> int:
     plan = plan_for(project, scan_meta)
     print(f"Project #{plan['odoo_id']}: {plan['title']}")
     print(f"  practice: {project.get('practice')}   tasks: {plan['task_count']}")
-    print(f"  would create 1 project page + {len(plan['sections'])} section pages")
+    print(f"  would create 1 project page + {len(plan['sections'])} sections "
+          f"+ {plan['task_count']} task subpages "
+          f"= {1 + len(plan['sections']) + plan['task_count']} documents")
     for section in plan["sections"]:
-        first = section["body"].splitlines()[0] if section["body"] else "(empty)"
-        print(f"     - {section['title']:<24} {first[:52]}")
+        note = f"{plan['task_count']} subpages" if section["title"] == "Tasks" else "empty"
+        print(f"     - {section['title']:<24} ({note})")
 
     if args.dry_run:
         print("\nDRY RUN. Nothing written.")
         return 0
 
-    log.info("creating Outline page for odoo#%s %r", project["id"], project.get("name"))
-    created = create_project_page(client, collection, plan)
+    log.info("creating atlas page for odoo#%s %r", project["id"], project.get("name"))
+    created = create_project_page(client, collection, plan,
+                                  odoo=OdooSessionClient.from_file(),
+                                  delay=args.delay)
     record_creation(mapping, project, created, url, collection)
     log_created(project, created, url, plan["task_count"])
     print(f"\n  created: {url}{created.get('url')}")
     for section in created["sections"]:
         print(f"     {section['title']:<24} {url}{section.get('url')}")
+    print(f"     {created['task_pages']} task subpages under Tasks")
     log.info("mapping saved to %s", MAPPING_FILE)
     return 0
+
+
+def cmd_fill_tasks(args: argparse.Namespace) -> int:
+    url, key, collection = outline_credentials()
+    client = OutlineClient(url, key)
+    odoo_scan = load_scan()
+    scan_meta = odoo_scan.get("scan") or {}
+    result = compare(odoo_scan, load_outline_scan(), load_mapping())
+
+    rows = result["linked"] + (result["title_matched"]
+                               if args.include_title_matched else [])
+    if args.project:
+        wanted = {str(p) for p in args.project}
+        rows = [row for row in rows if str(row["odoo_id"]) in wanted]
+        unknown = wanted - {str(row["odoo_id"]) for row in rows}
+        if unknown:
+            raise SyncError(f"Not a synced project: {', '.join(sorted(unknown))}\n"
+                            "Only projects that already have an Atlas page can "
+                            "be filled. Use 'compare --show drift' to list them.")
+    if not rows:
+        print("No synced projects to check.")
+        return 0
+
+    projects = {p["id"]: p for p in (odoo_scan.get("projects") or [])}
+    gaps, skipped = task_gaps(client, rows, projects, scan_meta, collection)
+
+    if not args.include_title_matched and result["title_matched"]:
+        print(f"  {len(result['title_matched'])} title-matched pages were not "
+              "checked; their tasks predate this tool and carry no id.")
+        print("  (--include-title-matched to add subpages there too)\n")
+
+    for entry in skipped:
+        print(f"  skipped odoo#{entry['odoo_id']:<6} "
+              f"{str(entry['odoo_name'])[:40]:<42} {entry['why']}")
+
+    if not gaps:
+        print("Every synced project already has all of its Odoo tasks.")
+        return 0
+
+    total = sum(len(entry["tasks"]) for entry in gaps)
+    print(f"{len(gaps)} project(s) missing {total} task subpage(s):\n")
+    for entry in sorted(gaps, key=lambda e: -len(e["tasks"]))[:PREVIEW_ROWS]:
+        row = entry["row"]
+        print(f"  odoo#{row['odoo_id']:<6} {str(row['odoo_name'])[:40]:<42} "
+              f"{entry['present']:>4} present, {len(entry['tasks']):>4} missing")
+    if len(gaps) > PREVIEW_ROWS:
+        print(f"  ... and {len(gaps) - PREVIEW_ROWS} more")
+
+    if args.dry_run:
+        print("\nDRY RUN. Nothing written.")
+        return 0
+
+    odoo = OdooSessionClient.from_file()
+    made = failures = 0
+    for index, entry in enumerate(gaps, start=1):
+        row = entry["row"]
+        try:
+            count = create_task_pages(client, odoo, collection,
+                                      entry["section_id"], entry["tasks"],
+                                      args.delay)
+            made += count
+            append_sync_log([f"- {now_iso()} FILL odoo#{row['odoo_id']} "
+                             f"{row['odoo_name']!r} +{count} task subpages"])
+            log.info("[%d/%d] odoo#%s +%d task subpages",
+                     index, len(gaps), row["odoo_id"], count)
+        except HQError as exc:
+            failures += 1
+            log.error("[%d/%d] odoo#%s failed: %s", index, len(gaps),
+                      row["odoo_id"], str(exc).splitlines()[0][:140])
+
+    print(f"\n  created {made} task subpages, {failures} project(s) failed")
+    print("  refresh the Atlas snapshot:  python Outline-Scanner.py scan")
+    return 1 if failures and not made else 0
 
 
 def print_sync_plan(run_id: str, scan_meta: dict, outline_meta: dict, result: dict,
@@ -458,7 +608,7 @@ def print_sync_plan(run_id: str, scan_meta: dict, outline_meta: dict, result: di
     print(f"Sync run {run_id}")
     print(f"  odoo scan run    {scan_meta.get('run_id')}")
     print(f"  outline snapshot {outline_meta.get('run_id')}")
-    print(f"\n  {len(result['odoo_only'])} projects have no Outline page")
+    print(f"\n  {len(result['odoo_only'])} projects have no Atlas page")
     if not include_probable:
         print(f"  {len(result['probable'])} probable duplicates excluded "
               "(--include-probable to force)")
@@ -466,8 +616,10 @@ def print_sync_plan(run_id: str, scan_meta: dict, outline_meta: dict, result: di
         print(f"  no cap set -- all {available} would be created")
     else:
         print(f"  capped at {cap} of {available} by {cap_source}")
+    subpages = sum(row["odoo_tasks"] for row in todo)
     print(f"\n  would create {len(todo)} project pages "
-          f"= {len(todo) * (1 + len(SECTIONS))} documents")
+          f"+ {len(todo) * len(SECTIONS)} sections + {subpages} task subpages "
+          f"= {len(todo) * (1 + len(SECTIONS)) + subpages} documents")
     for row in todo[:PREVIEW_ROWS]:
         print(f"     odoo#{row['odoo_id']:<6} {str(row['odoo_name'])[:42]:<44} "
               f"{row['odoo_tasks']:>4} tasks")
@@ -510,6 +662,7 @@ def cmd_sync_all(args: argparse.Namespace) -> int:
         return 0
 
     pages = live_titles(client, collection)
+    odoo = OdooSessionClient.from_file()
     log.info("sync run %s: creating %d project pages", run_id, len(todo))
     created_records: list[dict] = []
     failures: list[dict] = []
@@ -522,7 +675,8 @@ def cmd_sync_all(args: argparse.Namespace) -> int:
         try:
             guard_duplicate(project, pages, args.include_probable)
             plan = plan_for(project, scan_meta)
-            created = create_project_page(client, collection, plan)
+            created = create_project_page(client, collection, plan, odoo=odoo,
+                                          delay=args.delay)
             record_creation(mapping, project, created, url, collection)
             log_created(project, created, url, plan["task_count"])
             created_records.append({
@@ -531,13 +685,16 @@ def cmd_sync_all(args: argparse.Namespace) -> int:
                 "outline_document_id": created["document_id"],
                 "outline_url": f"{url}{created.get('url')}",
                 "task_count": plan["task_count"],
+                "task_pages": created["task_pages"],
                 "sections": [s["title"] for s in created["sections"]],
                 "created_at": now_iso(),
             })
             pages.append({"id": created["document_id"], "title": plan["title"],
                           "sections": SECTIONS})
-            log.info("[%d/%d] odoo#%s %s -> %s", index, len(todo), project["id"],
-                     str(project.get("name"))[:40], created.get("url"))
+            log.info("[%d/%d] odoo#%s %s -> %s (%d task subpages)",
+                     index, len(todo), project["id"],
+                     str(project.get("name"))[:40], created.get("url"),
+                     created["task_pages"])
         except HQError as exc:
             failures.append({"odoo_id": project["id"],
                              "odoo_name": project.get("name"), "error": str(exc)})
@@ -574,15 +731,15 @@ def cmd_sync_all(args: argparse.Namespace) -> int:
                          f"{f['error'].splitlines()[0][:160]}" for f in failures])
     log.info("created %d, failed %d; run record %s",
              len(created_records), len(failures), record_path.name)
-    print("\n  refresh the Outline snapshot:  python Outline-Scanner.py scan")
+    print("\n  refresh the Atlas snapshot:  python Outline-Scanner.py scan")
     return 1 if failures and not created_records else 0
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="HQ-Outline-Sync.py",
-        description="Compare the Odoo and Outline snapshots, and create missing "
-                    "Outline project pages. Create-only.")
+        description="Compare the Odoo and Atlas snapshots, and create missing "
+                    "Atlas project pages. Create-only.")
     add_common_arguments(parser)
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -593,7 +750,7 @@ def main(argv: list[str] | None = None) -> int:
                                     help="compare both snapshots (offline)")
     compare_parser.add_argument("--show", default="none",
                                 choices=["none", "drift", "probable", "odoo-only",
-                                         "outline-only", "all"])
+                                         "atlas-only", "all"])
     compare_parser.add_argument("--limit", type=int, default=20)
     compare_parser.set_defaults(func=cmd_compare)
 
@@ -605,9 +762,24 @@ def main(argv: list[str] | None = None) -> int:
     sync.add_argument("project", help="Odoo project id")
     sync.add_argument("--dry-run", action="store_true",
                       help="plan only, write nothing")
+    sync.add_argument("--delay", type=float, default=0.3,
+                      help="seconds between document creates")
     sync.add_argument("--force", action="store_true",
                       help="create even if a similar page exists")
     sync.set_defaults(func=cmd_sync)
+
+    fill = sub.add_parser("fill-tasks",
+                          help="add task subpages missing from synced projects")
+    fill.add_argument("project", nargs="*",
+                      help="Odoo project ids; default: every synced project")
+    fill.add_argument("--dry-run", action="store_true",
+                      help="report the gaps, write nothing")
+    fill.add_argument("--delay", type=float, default=0.3,
+                      help="seconds between document creates")
+    fill.add_argument("--include-title-matched", action="store_true",
+                      help="also fill pages matched only by title, whose "
+                           "existing tasks carry no Odoo id")
+    fill.set_defaults(func=cmd_fill_tasks)
 
     sync_all = sub.add_parser("sync-all",
                               help="create pages for every project that has none")

@@ -1,11 +1,4 @@
-"""Authenticate against Odoo and store a session token.
-
-Odoo issues no OAuth token for username/password login, it issues a session_id
-cookie. That cookie is what gets stored; the password is used once and never
-written to disk.
-"""
 from __future__ import annotations
-
 import argparse
 import getpass
 import html
@@ -149,11 +142,6 @@ class OdooSessionAuth:
         }
 
     def _form_login(self, login: str, password: str) -> str | None:
-        """Post the HTML login form with its CSRF token.
-
-        This path needs no database name: the server resolves it via dbfilter.
-        Landing back on the login page means the credentials were rejected.
-        """
         try:
             with self.opener.open(f"{self.url}/web/login", timeout=60) as response:
                 page = response.read().decode("utf-8", "replace")
@@ -184,7 +172,6 @@ class OdooSessionAuth:
         return self._cookie()
 
     def _jsonrpc_login(self, login: str, password: str, db: str) -> str | None:
-        """Fallback for servers with no login form. Needs an explicit db name."""
         result = jsonrpc(self.url, "/web/session/authenticate",
                          {"db": db, "login": login, "password": password},
                          verify_ssl=self.verify_ssl)
@@ -309,7 +296,6 @@ class UIHandler(BaseHTTPRequestHandler):
             log.error("login failed: %s", exc)
 
     def _signal_success(self, record: dict) -> None:
-        """Release login_via_browser, if that is what started this server."""
         event = getattr(self.server, "login_event", None)
         if event is not None:
             self.server.login_record = record
@@ -318,12 +304,6 @@ class UIHandler(BaseHTTPRequestHandler):
 
 def login_via_browser(host: str = UI_HOST, port: int = UI_PORT,
                       open_browser: bool = True) -> dict:
-    """Serve the login page, wait for one successful login, return the record.
-
-    The wait polls rather than blocking outright, so Ctrl+C still works on
-    Windows, and lingers briefly afterwards so the success page reaches the
-    browser before the server closes.
-    """
     load_login_template()
     server = ThreadingHTTPServer((host, port), UIHandler)
     server.login_event = threading.Event()
@@ -354,11 +334,6 @@ def login_via_browser(host: str = UI_HOST, port: int = UI_PORT,
 
 
 def ensure_session(open_browser: bool = True) -> dict:
-    """A valid Odoo session, logging in through the browser if there is none.
-
-    Covers all three cases: no credentials file, an empty or unreadable one,
-    and a stored session the server has since expired.
-    """
     try:
         record = validate_credentials(load_credentials())
     except (OdooAuthError, json.JSONDecodeError, KeyError) as exc:

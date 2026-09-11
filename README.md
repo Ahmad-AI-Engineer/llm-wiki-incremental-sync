@@ -1,7 +1,13 @@
 # HQ Odoo → Outline sync pipeline
 
 Syncs Odoo project data into the **Atlas** Outline knowledge base
-(`https://atlas.axm.app`, collection *Odoo Projects*).
+(`https://atlas.axm.app`, collection *Odoo Projects*). Everything the tools
+print calls it **Atlas**; "Outline" appears here and in the code only where it
+means the Outline product, its API, or a filename.
+
+Only **customer** projects are synced — those a sale order created, which is
+also where their practice comes from. Internal projects have no practice and
+never enter the pipeline.
 
 Source: Odoo 19 at `https://theaxiomworld.com`, db `Axiom_HQ_19`.
 No dependencies — Python 3.11+ standard library only.
@@ -32,13 +38,14 @@ then asks:
 
 ```
 Missing in Atlas
-  odoo#377    S00258 - 12panel Upgrdation V17                 229 tasks
-  odoo#205    S00111 - The Seating Shoppe, Luzy Stein         221 tasks
-  ... and 231 more
+  odoo#32     S00141 - Fell Technology AS                     577 tasks
+  odoo#189    S00098 - Silicon Signs                          397 tasks
+  ... and 243 more
 
-  236 projects need to be created in Atlas.
-  47 more look like duplicates of existing pages and are excluded.
+  245 projects need to be created in Atlas.
+  43 more look like duplicates of existing pages and are excluded.
   SYNC_CAP is 4, so this run would create 4 of them.
+  That is 1,478 documents: 4 project pages, 32 sections, 1,442 task subpages.
 
 Create these projects in Atlas? [y/N]:
 ```
@@ -150,10 +157,11 @@ python HQ-Scanner.py practice-of 1068      # practice of one project
 python HQ-Scanner.py scan --practice Odoo  # the scan (Odoo is the default)
 ```
 
-### How practice is determined
+### Only customer projects are in scope
 
-`project.project` has no practice column. The practice is the **product
-category of the sale order line that created the project**:
+A project counts as a customer project when a sale order created it. That is
+also where its practice comes from — the **product category of the sale order
+line**:
 
 ```
 project_project.sale_line_id  →  sale_order_line.id
@@ -171,11 +179,15 @@ is exactly the practice list, so practice is read from a real field:
 | Website/Design | 32 |
 | DevOps | 19 |
 | NetSuite | 15 |
-| (no sale order — internal projects) | 209 |
 
 Odoo writes `sale_line_id` when a service product with *Service Tracking =
-create a project* is sold. Projects created by hand never get it, so internal
-work has no determinable practice — scoped out for now by decision.
+create a project* is sold. Projects created by hand never get one, so they
+have no practice and no customer — internal work, roughly 209 projects. **They
+never enter the pipeline**, so there is no code path for them: no practice
+means not selected, and `--practice ""` means every *customer* project rather
+than literally every project. A sale sitting in a catch-all category
+(`All`, `Services`, …) counts as internal too, since the category names no
+practice.
 
 Rejected alternatives, by measurement: no "ERP" category exists; `hr.department`
 resolves 0 Odoo projects (the Odoo department has no employees); `tag_ids`
@@ -188,14 +200,16 @@ Project name, practice, task names and assignees:
 ```json
 {
   "id": 992, "name": "S00667 - America Cryo", "practice": "Odoo",
-  "practice_source": "product_category",
   "practice_evidence": "Odoo Services - Prepaid/Fixed Price",
   "tasks": [{ "id": 1, "name": "Sale Order Discovery Session",
               "assignees": ["Muhammad usman Talib", "Sameer Ahmad"] }]
 }
 ```
 
-Current: **310 projects, 12,189 tasks, ~1.3 MB.**
+The `scan` block records `projects_examined`, `customer_project_count` and
+`project_count` (the selected practice), so the narrowing is visible.
+
+Current: **311 projects, 12,209 tasks, ~2.8 MB.**
 
 ## 3. Scan Outline
 
@@ -229,6 +243,8 @@ python HQ-Outline-Sync.py sync 992                # DRY RUN, one project
 python HQ-Outline-Sync.py sync 992 --apply        # writes to Outline
 python HQ-Outline-Sync.py sync-all                # DRY RUN, everything missing
 python HQ-Outline-Sync.py sync-all --apply        # honours SYNC_CAP
+python HQ-Outline-Sync.py fill-tasks              # DRY RUN, find missing task subpages
+python HQ-Outline-Sync.py fill-tasks 32 --apply   # add them for one project
 ```
 
 `sync-all` saves the mapping after **every** project, so an interrupted run is
@@ -254,16 +270,47 @@ cannot silently duplicate an existing page.
 
 ### Page template
 
-Seven child documents per project, created in this order:
+Eight child documents per project, created in this order:
 
 ```
 Overview · Customer Introduction · Tasks · Roadmap · Customizations ·
-Scope of Work · Meetings
+Scope of Work · Meetings · Case Studies
 ```
 
-Only **Tasks** has an Odoo source (a task/assignee table). The other six are
-created empty for humans to fill. Outline inserts new siblings at the top, so
-sections are created in reverse to land in the intended order.
+All eight are created **empty**. Seven stay empty for humans to fill; `Tasks`
+is a container.
+
+### Task subpages
+
+Every Odoo task becomes its own child document under `Tasks`:
+
+```
+S00667 - America Cryo
+└── Tasks                          (empty container)
+    ├── 962 - Sale Order Discovery Session
+    ├── 1081 - Data migration plan
+    └── ...
+```
+
+Subpages are titled `<odoo task id> - <task name>`. The id is what makes
+re-syncing reliable: `fill-tasks` matches on it, so a task renamed in Odoo
+still finds its page, and the 47 cases where two tasks in one project share a
+name stop being ambiguous.
+
+Atlas rejects any title over **100 characters**, so the name is truncated to
+fit alongside the id (167 task names need this). The full name is written in
+bold at the top of the page body, so nothing is lost.
+
+Each task page holds the assignees line and the task's Odoo description. About
+**46% of tasks have no description**, and those pages are created empty on
+purpose, so the structure is uniform and somebody can fill them in.
+
+Descriptions are HTML in Odoo and get converted to markdown on the way through.
+They are fetched **at write time, not during the scan** — see the image note
+below for why.
+
+A project page therefore costs `1 + 8 + <task count>` documents. America Cryo
+(46 tasks) is 55; Fell Technology AS (577 tasks) is 586.
 
 ### Safety
 
@@ -277,18 +324,18 @@ sections are created in reverse to land in the intended order.
 ## Current sync state
 
 ```
-linked by id marker/mapping :    1
-matched by title only       :   22
-probable match, needs review:   43
-in Odoo only  (to create)   :  244
-in Outline only (orphans)   :  102
-matched but drifted         :   22
+linked by id marker/mapping  :    0
+matched by title only        :   23
+probable match, needs review :   43
+in Odoo only  (to create)    :  245
+in Atlas only (unmatched)    :  102
+matched but drifted          :   23
 ```
 
 All 22 title-matched pages have drifted: Odoo consistently holds far more tasks
-than Outline lists (`Askari GGS` 236 vs 10, `Stratus Plastics` 275 vs 33), and
-most are missing several template sections. The 102 "orphans" include the pages
-behind the 43 probable matches, so they are not all unrelated.
+than Atlas lists (`Askari GGS` 236 vs 10, `Stratus Plastics` 275 vs 33), and
+most are missing several template sections. The 102 unmatched pages include the
+ones behind the 47 probable matches, so they are not all unrelated.
 
 ## Output files
 
@@ -313,3 +360,52 @@ Nothing prunes `output/history/`.
 - **Change-driven ingest.** Snapshots are kept but not diffed run-to-run, so
   there is no "what changed since last sync" changeset yet.
 - **Scheduling.** Everything is run by hand.
+
+## Things the code will not tell you
+
+The source carries no comments by choice. These are the non-obvious bits, so
+nobody "fixes" one of them back into a bug.
+
+- **Sections are created in reverse.** Outline inserts every new sibling at the
+  top of its parent, so `create_project_page` walks `SECTIONS` backwards to
+  land them in the intended order. Un-reversing it reverses the page.
+- **A project with no practice is invisible.** `load_practices` only returns
+  projects whose sale order line has a real product category, so internal work
+  never reaches the rest of the pipeline. `--practice ""` therefore means
+  "every *customer* project", not "every project".
+- **Console output is forced to UTF-8.** Some Odoo project names carry
+  characters a Windows cp1252 console cannot encode, which used to abort a
+  report part-way through with `UnicodeEncodeError`.
+- **`-v` outranks `LOG_LEVEL`.** `configure_logging` is safe to call twice and
+  sets the console level every time; the file log is always DEBUG.
+- **`compare()` runs more than once per pipeline run**, so a duplicate-title
+  collision is warned about only the first time it is seen.
+- **Landing back on `/web/login` means bad credentials.** That is how
+  `_form_login` detects rejection — Odoo returns 200 with the form again.
+- **A stray `Retry-After` is honoured.** `OutlineClient.call` retries 429s and
+  transient network errors up to four times before giving up.
+- **The pipeline is create-only.** Nothing edits or renames an existing Atlas
+  page, which is why drift is reported but never repaired.
+- **Task descriptions never enter the snapshot.** 99.4% of their payload is
+  base64 screenshots: storing them would take `projects_and_tasks.json` from
+  2.8 MB to roughly a gigabyte. They are fetched per project at write time and
+  images are dropped on arrival, replaced by a placeholder line. Screenshots
+  stay in Odoo.
+- **Task subpages are created in reverse too**, for the same reason sections
+  are: Outline puts each new sibling at the top.
+- **Atlas rejects titles over 100 characters.** Task titles are
+  `<id> - <name>`, and the name is truncated to fit. Exceeding it is a hard
+  HTTP 400, not a warning.
+- **Atlas caps `documents.create` at roughly 25/min.** On the first 429 the
+  client jumps straight to `PACING_START` (2s) and fine-tunes from there, so it
+  finds the ceiling in a step or two instead of crawling down from 150/min and
+  burning a `Retry-After` sleep on every rung. You get one `backing off`
+  warning, then one `settled at about N/min` line once it is actually true.
+  A full sync of ~8,800 documents is still hours of wall time, so run it in
+  chunks with `SYNC_CAP`.
+- **`fill-tasks` only touches pages this tool made.** Title-matched pages were
+  written by hand and their task lists carry no Odoo id, so filling them would
+  stack generated subpages on top of somebody's work. `--include-title-matched`
+  opts in.
+- **Archived Odoo users still get named.** `res.users` hides inactive records
+  by default, which left 28% of assignees showing as `user:<id>`.

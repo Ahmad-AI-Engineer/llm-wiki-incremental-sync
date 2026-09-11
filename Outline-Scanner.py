@@ -1,4 +1,3 @@
-"""Snapshot the Outline project collection to JSON."""
 from __future__ import annotations
 
 import argparse
@@ -6,13 +5,12 @@ import json
 import re
 from pathlib import Path
 
-from hq_common import (HISTORY_DIR, OUT_DIR, OUTLINE_SCAN_FILE, HQError,
+from hq_common import (HISTORY_DIR, OUT_DIR, OUTLINE_SCAN_FILE,
+                       TASK_SECTION_TITLES, HQError,
                        OutlineClient, add_common_arguments, configure_logging,
                        get_logger, next_run_id, now_iso, outline_credentials)
 
 ODOO_ID_PATTERN = re.compile(r"odoo-project-id:\s*(\d+)")
-TASK_SECTION_TITLES = {"tasks", "task", "task list", "tasks detail",
-                       "operational tasks"}
 MAX_TREE_DEPTH = 2
 
 log = get_logger("outline-scanner")
@@ -23,7 +21,6 @@ class OutlineScanError(HQError):
 
 
 def table_first_column(text: str) -> list[str]:
-    """First cell of every markdown table row, skipping header and separator."""
     values = []
     for line in (text or "").splitlines():
         line = line.strip()
@@ -39,11 +36,6 @@ def table_first_column(text: str) -> list[str]:
 
 
 def build_tree(documents: list[dict]) -> tuple[list[dict], dict[str, list[dict]]]:
-    """Split the flat document list into top-level pages and a child index.
-
-    A document whose parent is outside this collection counts as top-level,
-    rather than being dropped from the snapshot entirely.
-    """
     by_id = {doc["id"]: doc for doc in documents}
     children: dict[str, list[dict]] = {}
     roots: list[dict] = []
@@ -52,7 +44,7 @@ def build_tree(documents: list[dict]) -> tuple[list[dict], dict[str, list[dict]]
         if parent and parent in by_id:
             children.setdefault(parent, []).append(doc)
         elif parent:
-            log.warning("document %r has a parent outside the collection; "
+            log.warning("document %r has a parent outside the collection, "
                         "counted as a top-level page", doc.get("title"))
             roots.append(doc)
         else:
@@ -75,7 +67,6 @@ def describe(doc: dict, children: dict[str, list[dict]], depth: int = 0) -> dict
 
 
 def task_names_for(sections: list[dict], by_id: dict[str, dict]) -> list[str]:
-    """Task names under a section titled like Tasks: table rows and child pages."""
     names: list[str] = []
     for section in sections:
         if str(section["title"] or "").strip().lower() not in TASK_SECTION_TITLES:
@@ -92,7 +83,7 @@ def scan(client: OutlineClient, collection_id: str,
     run_id = next_run_id("outline")
     who = client.whoami()
     collection = client.collection_info(collection_id)
-    log.info("outline scan %s: collection %r", run_id, collection.get("name"))
+    log.info("atlas scan %s: collection %r", run_id, collection.get("name"))
 
     documents = client.all_documents(collection_id)
     by_id = {doc["id"]: doc for doc in documents}
@@ -165,7 +156,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
 def cmd_sections(args: argparse.Namespace) -> int:
     if not OUTLINE_SCAN_FILE.exists():
-        raise OutlineScanError(f"No Outline snapshot at {OUTLINE_SCAN_FILE}\n"
+        raise OutlineScanError(f"No Atlas snapshot at {OUTLINE_SCAN_FILE}\n"
                                "Run first:  python Outline-Scanner.py scan")
     document = json.loads(OUTLINE_SCAN_FILE.read_text(encoding="utf-8"))
     vocabulary = document.get("section_vocabulary") or {}
@@ -181,7 +172,7 @@ def cmd_sections(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="Outline-Scanner.py",
-        description="Snapshot the Outline project collection to JSON.")
+        description="Snapshot the Atlas project collection to JSON.")
     add_common_arguments(parser)
     sub = parser.add_subparsers(dest="command", required=True)
 

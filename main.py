@@ -1,14 +1,3 @@
-"""Entry point: check the Odoo session, scan both sides, compare, then create
-the missing Atlas pages after asking.
-
-    STEP 1/5  check the Odoo session   (browser login if there is none)
-    STEP 2/5  scan Odoo                -> output/projects_and_tasks.json
-    STEP 3/5  scan Atlas               -> output/outline_projects.json
-    STEP 4/5  compare the snapshots    -> what is missing in Atlas
-    STEP 5/5  create the missing pages (only after you answer yes)
-
-Nothing is written to Atlas without a yes at the prompt, or --yes.
-"""
 from __future__ import annotations
 
 import argparse
@@ -32,7 +21,6 @@ class PipelineError(HQError):
 
 
 def load_script(filename: str) -> ModuleType:
-    """Import a hyphenated script file as a module."""
     path = BASE_DIR / filename
     if not path.exists():
         raise PipelineError(f"Missing script: {path}")
@@ -103,8 +91,8 @@ def sync_cap() -> int | None:
         raise PipelineError(str(exc)) from None
 
 
-def report_missing(result: dict, cap: int | None) -> list[dict]:
-    """Show the first few missing projects, then the total. Returns them all."""
+def report_missing(result: dict, cap: int | None,
+                   section_count: int) -> list[dict]:
     missing = sorted(result["odoo_only"], key=lambda row: -row["odoo_tasks"])
     if not missing:
         print("\nEverything in this practice already has an Atlas page.")
@@ -121,8 +109,14 @@ def report_missing(result: dict, cap: int | None) -> list[dict]:
     if result["probable"]:
         print(f"  {len(result['probable'])} more look like duplicates of existing "
               "pages and are excluded.")
+
+    this_run = missing if cap is None else missing[:cap]
     if cap is not None and cap < len(missing):
         print(f"  SYNC_CAP is {cap}, so this run would create {cap} of them.")
+    subpages = sum(row["odoo_tasks"] for row in this_run)
+    documents = len(this_run) * (1 + section_count) + subpages
+    print(f"  That is {documents:,} documents: {len(this_run)} project pages, "
+          f"{len(this_run) * section_count} sections, {subpages:,} task subpages.")
     return missing
 
 
@@ -149,8 +143,6 @@ def confirm(question: str, assume_yes: bool) -> bool:
 def write_run_record(run_id: str, args: argparse.Namespace, approved: bool,
                      odoo_result: dict, atlas_result: dict,
                      comparison: dict) -> None:
-    """Write the run record. Counts describe the state that was compared,
-    before any pages were created."""
     record = {
         "pipeline": {
             "run_id": run_id,
@@ -218,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
             atlas_result = step_atlas_scan(outline)
 
         comparison = step_compare(sync)
-        missing = report_missing(comparison, sync_cap())
+        missing = report_missing(comparison, sync_cap(), len(sync.SECTIONS))
 
         exit_code = 0
         approved = False

@@ -1,22 +1,17 @@
-"""Shared helpers for the HQ Odoo -> Outline pipeline.
-
-The top-level scripts have hyphens in their names, which are not valid Python
-module names, so they cannot import each other. Anything used by more than one
-of them lives here: paths, the error base class, .env loading, run ids,
-logging, and the Outline API client.
-"""
 from __future__ import annotations
-
+import html
 import json
 import logging
 import logging.handlers
 import os
 import re
+import ssl
 import sys
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -40,19 +35,32 @@ SYNC_LOG_FILE = OUT_DIR / "sync_log.md"
 DEFAULT_OUTLINE_URL = "https://atlas.axm.app"
 DEFAULT_COLLECTION_ID = "393ead77-88e3-46f3-8e16-dff19fafe1d1"
 
+TASK_DESCRIPTION_BATCH = 100
+
+TITLE_LIMIT = 100
+
+TASK_SECTION_TITLES = {"tasks", "task", "task list", "tasks detail",
+                       "operational tasks"}
+
+RATE_LIMIT_RETRIES = 12
+RATE_LIMIT_FALLBACK = 30.0
+PACING_START = 2.0
+PACING_STEP = 0.4
+PACING_MAX = 3.0
+
 log = logging.getLogger(__name__)
 
 
 class HQError(RuntimeError):
-    """A failure with a message meant for the user.
-
-    Every script subclasses this and reports it as a single error line instead
-    of a traceback.
-    """
+    pass
 
 
 class OutlineError(HQError):
-    """The Outline API refused a call or could not be reached."""
+    pass
+
+
+class OdooError(HQError):
+    pass
 
 
 def now_iso() -> str:
@@ -64,7 +72,6 @@ def today_stamp() -> str:
 
 
 def read_env() -> dict[str, str]:
-    """Real environment variables win over .env entries."""
     values = dict(os.environ)
     if ENV_PATH.exists():
         for raw in ENV_PATH.read_text(encoding="utf-8").splitlines():
@@ -77,11 +84,6 @@ def read_env() -> dict[str, str]:
 
 
 def env_positive_int(name: str, env: dict[str, str] | None = None) -> int | None:
-    """Read an optional positive-integer setting. Empty or absent returns None.
-
-    Raises ValueError for a non-numeric or non-positive value, so a typo in
-    .env fails loudly instead of silently disabling the setting.
-    """
     env = env if env is not None else read_env()
     raw = (env.get(name) or "").strip()
     if not raw:
@@ -97,7 +99,6 @@ def env_positive_int(name: str, env: dict[str, str] | None = None) -> int | None
 
 
 def next_run_id(prefix: str, history_dir: Path = HISTORY_DIR) -> str:
-    """Sequential id per source per day, e.g. 20260909-003."""
     day = today_stamp()
     used = []
     if history_dir.exists():
@@ -116,19 +117,10 @@ LOG_BACKUPS = 3
 
 
 def get_logger(name: str) -> logging.Logger:
-    """A logger for one script. configure_logging installs the handlers."""
     return logging.getLogger(name)
 
 
 def configure_logging(verbose: bool = False) -> None:
-    """Install console and rotating-file logging. Safe to call more than once.
-
-    Console level: --verbose wins, then LOG_LEVEL in .env, then INFO. The file
-    at output/logs/pipeline.log always keeps a full DEBUG trail.
-
-    Reports go to stdout and logs go to stderr, so `command > report.txt`
-    keeps them apart.
-    """
     _use_utf8_stdio()
 
     root = logging.getLogger()
@@ -167,12 +159,6 @@ def _console_level() -> int:
 
 
 def _use_utf8_stdio() -> None:
-    """Print UTF-8 whatever the console claims to be.
-
-    Windows consoles default to cp1252, and some Odoo project names contain
-    characters it cannot encode (a zero-width space, for one), which used to
-    abort a report part-way through with UnicodeEncodeError.
-    """
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
@@ -185,8 +171,158 @@ def add_common_arguments(parser) -> None:
                         help="debug-level logging")
 
 
+IMAGE_PLACEHOLDER = "_[screenshot — see the task in Odoo]_"
+
+INLINE_MARKS = {"b": "**", "strong": "**", "i": "*", "em": "*"}
+BLOCK_TAGS = {"p", "div", "tr", "table", "ul", "ol", "h1", "h2", "h3", "h4",
+              "h5", "h6", "blockquote"}
+SKIP_TAGS = {"script", "style", "head"}
+
+INDENT = ""
+
+
+def clean_title(name: str, limit: int = TITLE_LIMIT) -> str:
+    text = re.sub(r"\s+", " ", str(name or "")).strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit - 1].rstrip() + "…"
+
+
+def render_table(rows: list[list[str]]) -> str:
+    rows = [row for row in rows if any(cell for cell in row)]
+    if not rows:
+        return ""
+    width = max(len(row) for row in rows)
+    padded = [row + [""] * (width - len(row)) for row in rows]
+    escaped = [[cell.replace("|", r"\|") for cell in row] for row in padded]
+    header, *body = escaped
+    lines = ["| " + " | ".join(header) + " |",
+             "| " + " | ".join(["---"] * width) + " |"]
+    lines += ["| " + " | ".join(row) + " |" for row in body]
+    return "\n\n" + "\n".join(lines) + "\n\n"
+
+
+class _MarkdownWriter(HTMLParser):
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.list_stack: list[str] = []
+        self.item_index: list[int] = []
+        self.tables: list[list[list[str]]] = []
+        self.row: list[str] | None = None
+        self.cell: list[str] | None = None
+        self.link: str | None = None
+        self.skip = 0
+        self.li_depth = 0
+
+    def emit(self, text: str) -> None:
+        if self.cell is not None:
+            self.cell.append(text)
+        else:
+            self.parts.append(text)
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag in SKIP_TAGS:
+            self.skip += 1
+        elif tag == "img":
+            self.emit(" " + IMAGE_PLACEHOLDER + " " if self.cell is not None
+                      else "\n\n" + IMAGE_PLACEHOLDER + "\n\n")
+        elif tag == "br":
+            self.emit(" " if self.cell is not None else "\n")
+        elif tag in INLINE_MARKS:
+            self.emit(INLINE_MARKS[tag])
+        elif tag == "a":
+            self.link = attrs.get("href")
+            self.emit("[")
+        elif tag == "table":
+            self.tables.append([])
+        elif tag == "tr":
+            if self.tables:
+                self.row = []
+        elif tag in ("td", "th"):
+            if self.row is not None:
+                self.cell = []
+        elif tag in ("ul", "ol"):
+            self.list_stack.append(tag)
+            self.item_index.append(0)
+            if not self.li_depth:
+                self.emit("\n")
+        elif tag == "li":
+            self.li_depth += 1
+            depth = INDENT * max(len(self.list_stack) - 1, 0)
+            if self.list_stack and self.list_stack[-1] == "ol":
+                self.item_index[-1] += 1
+                self.emit(f"\n{depth}{self.item_index[-1]}. ")
+            else:
+                self.emit(f"\n{depth}- ")
+        elif tag in BLOCK_TAGS:
+            self.emit(" " if self.li_depth else "\n\n")
+
+    def handle_endtag(self, tag):
+        if tag in SKIP_TAGS:
+            self.skip = max(self.skip - 1, 0)
+        elif tag in INLINE_MARKS:
+            self.emit(INLINE_MARKS[tag])
+        elif tag == "a":
+            target = self.link or ""
+            self.emit(f"]({target})" if target else "]")
+            self.link = None
+        elif tag in ("td", "th"):
+            if self.cell is not None and self.row is not None:
+                self.row.append(re.sub(r"\s+", " ", "".join(self.cell)).strip())
+            self.cell = None
+        elif tag == "tr":
+            if self.row is not None and self.tables:
+                self.tables[-1].append(self.row)
+            self.row = None
+        elif tag == "table":
+            if self.tables:
+                self.parts.append(render_table(self.tables.pop()))
+        elif tag == "li":
+            self.li_depth = max(self.li_depth - 1, 0)
+        elif tag in ("ul", "ol"):
+            if self.list_stack:
+                self.list_stack.pop()
+                self.item_index.pop()
+            self.emit("\n")
+        elif tag in BLOCK_TAGS:
+            self.emit(" " if self.li_depth else "\n\n")
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.emit(data.replace("\xa0", " "))
+
+    def text(self) -> str:
+        body = "".join(self.parts)
+        body = re.sub(r"[ \t]+", " ", body)
+        body = re.sub(r" *\n *", "\n", body)
+        body = re.sub(r"\n{3,}", "\n\n", body)
+        return body.replace(INDENT, "  ").strip()
+
+
+def html_to_markdown(source: str) -> str:
+    if not source:
+        return ""
+    if "<" not in source:
+        return html.unescape(source).strip()
+    writer = _MarkdownWriter()
+    try:
+        writer.feed(source)
+        writer.close()
+    except Exception as exc:
+        log.warning("could not parse a description as HTML (%s), "
+                    "falling back to stripped text", exc)
+        return html.unescape(re.sub(r"<[^>]+>", " ", source)).strip()
+    return writer.text()
+
+
+def strip_images(source: str) -> str:
+    return re.sub(r"<img\b[^>]*>", "<img>", source or "", flags=re.IGNORECASE)
+
+
 def outline_credentials() -> tuple[str, str, str]:
-    """(url, api_key, collection_id) for the Outline knowledge base."""
     env = read_env()
     key = (env.get("OUTLINE_API_KEY") or env.get("Outline API Key")
            or env.get("OUTLINE_TOKEN") or "").strip()
@@ -195,18 +331,45 @@ def outline_credentials() -> tuple[str, str, str]:
         found = re.search(r"(ol_api_[A-Za-z0-9]+)", blob)
         key = found.group(1) if found else ""
     if not key:
-        raise OutlineError("No Outline API key found. Add OUTLINE_API_KEY=... to .env")
+        raise OutlineError("No Atlas API key found. Add OUTLINE_API_KEY=... to .env")
     url = (env.get("OUTLINE_URL") or DEFAULT_OUTLINE_URL).strip().rstrip("/")
     collection = (env.get("OUTLINE_COLLECTION_ID") or DEFAULT_COLLECTION_ID).strip()
     return url, key, collection
 
 
 class OutlineClient:
-    """Outline API client. Retries rate limits and transient network errors."""
 
     def __init__(self, url: str, api_key: str) -> None:
         self.url = url
         self.api_key = api_key
+        self.min_interval = 0.0
+        self._last_call = 0.0
+        self._paced = False
+        self._settled = False
+
+    def _pace(self) -> None:
+        if self.min_interval:
+            gap = time.monotonic() - self._last_call
+            if gap < self.min_interval:
+                time.sleep(self.min_interval - gap)
+        self._last_call = time.monotonic()
+
+    def _slow_down(self, endpoint: str) -> None:
+        self.min_interval = min(max(self.min_interval + PACING_STEP, PACING_START),
+                                PACING_MAX)
+        self._settled = False
+        if not self._paced:
+            self._paced = True
+            log.warning("atlas rate limited on %s; backing off", endpoint)
+        else:
+            log.debug("atlas still rate limited on %s; interval now %.1fs",
+                      endpoint, self.min_interval)
+
+    def _note_settled(self) -> None:
+        if self._paced and not self._settled:
+            self._settled = True
+            log.info("atlas creates settled at about %.0f/min",
+                     60 / self.min_interval)
 
     def call(self, endpoint: str, payload: dict | None = None,
              timeout: int = 90, attempts: int = 4) -> dict:
@@ -214,28 +377,37 @@ class OutlineClient:
         headers = {"Content-Type": "application/json",
                    "Accept": "application/json",
                    "Authorization": f"Bearer {self.api_key}"}
-        for attempt in range(1, attempts + 1):
+        network_tries = 0
+        limit_tries = 0
+        while True:
+            self._pace()
             request = urllib.request.Request(f"{self.url}/api/{endpoint}",
                                              data=body, headers=headers)
             try:
                 with urllib.request.urlopen(request, timeout=timeout) as response:
-                    return json.loads(response.read().decode("utf-8", "replace"))
+                    result = json.loads(response.read().decode("utf-8", "replace"))
+                self._note_settled()
+                return result
             except urllib.error.HTTPError as exc:
-                if exc.code == 429 and attempt < attempts:
-                    wait = float(exc.headers.get("Retry-After") or 2 ** attempt)
-                    log.warning("rate limited on %s, waiting %.0fs", endpoint, wait)
+                if exc.code == 429 and limit_tries < RATE_LIMIT_RETRIES:
+                    limit_tries += 1
+                    wait = float(exc.headers.get("Retry-After")
+                                 or RATE_LIMIT_FALLBACK)
+                    self._slow_down(endpoint)
+                    log.debug("rate limited on %s, waiting %.0fs (%d)",
+                              endpoint, wait, limit_tries)
                     time.sleep(wait)
                     continue
                 detail = exc.read()[:400].decode("utf-8", "replace")
                 raise OutlineError(
-                    f"Outline HTTP {exc.code} on {endpoint}: {detail}") from exc
+                    f"Atlas HTTP {exc.code} on {endpoint}: {detail}") from exc
             except urllib.error.URLError as exc:
-                if attempt < attempts:
+                network_tries += 1
+                if network_tries < attempts:
                     log.warning("%s unreachable (%s), retrying", endpoint, exc.reason)
-                    time.sleep(2 ** attempt)
+                    time.sleep(2 ** network_tries)
                     continue
                 raise OutlineError(f"Cannot reach {self.url}: {exc.reason}") from exc
-        raise OutlineError(f"{endpoint} failed after {attempts} attempts")
 
     def whoami(self) -> dict:
         return self.call("auth.info").get("data") or {}
@@ -270,5 +442,118 @@ class OutlineClient:
             payload["parentDocumentId"] = parent_id
         created = self.call("documents.create", payload).get("data") or {}
         if not created.get("id"):
-            raise OutlineError(f"Outline returned no document id for {title!r}")
+            raise OutlineError(f"Atlas returned no document id for {title!r}")
         return created
+
+    def update_document(self, document_id: str, text: str | None = None,
+                        title: str | None = None) -> dict:
+        payload: dict[str, Any] = {"id": document_id}
+        if text is not None:
+            payload["text"] = text
+        if title is not None:
+            payload["title"] = title
+        return self.call("documents.update", payload).get("data") or {}
+
+    def document_children(self, document_id: str,
+                          collection_id: str) -> list[dict]:
+        def walk(nodes):
+            for node in nodes:
+                if node.get("id") == document_id:
+                    return node.get("children") or []
+                found = walk(node.get("children") or [])
+                if found is not None:
+                    return found
+            return None
+        return walk(self.collection_tree(collection_id)) or []
+
+
+class OdooSessionClient:
+
+    def __init__(self, credentials: dict) -> None:
+        self.url = credentials["odoo_url"].rstrip("/")
+        self.session_id = credentials["session_id"]
+        self.db = credentials.get("db")
+        self.uid = credentials.get("uid")
+        self.username = credentials.get("username")
+        self.name = credentials.get("name")
+        self.server_version = credentials.get("server_version")
+        self.verify_ssl = credentials.get("verify_ssl", True)
+
+    @classmethod
+    def from_file(cls, path: Path = CRED_FILE) -> "OdooSessionClient":
+        if not path.exists():
+            raise OdooError(
+                f"No stored session at {path}\n"
+                "Authenticate first:  python HQ-Credentials-Manager.py ui")
+        return cls(json.loads(path.read_text(encoding="utf-8")))
+
+    def call_kw(self, model: str, method: str, args: list,
+                kwargs: dict | None = None, timeout: int = 180) -> Any:
+        payload = json.dumps({"jsonrpc": "2.0", "method": "call", "params": {
+            "model": model, "method": method, "args": args, "kwargs": kwargs or {},
+        }}).encode()
+        request = urllib.request.Request(
+            self.url + "/web/dataset/call_kw", data=payload, headers={
+                "Content-Type": "application/json",
+                "User-Agent": "HQ-Pipeline/1.0",
+                "Cookie": f"session_id={self.session_id}",
+                "X-Openerp-Session-Id": self.session_id,
+            })
+        context = None if self.verify_ssl else ssl._create_unverified_context()
+        try:
+            with urllib.request.urlopen(request, timeout=timeout,
+                                        context=context) as response:
+                body = json.loads(response.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as exc:
+            raise OdooError(f"HTTP {exc.code} calling {model}.{method}: "
+                            f"{exc.reason}") from exc
+        except urllib.error.URLError as exc:
+            raise OdooError(f"Cannot reach {self.url}: {exc.reason}") from exc
+
+        if "error" in body:
+            data = body["error"].get("data") or {}
+            name = data.get("name", "")
+            message = str(data.get("message")
+                          or body["error"].get("message") or "").strip()
+            if "SessionExpired" in name or "Session expired" in message:
+                raise OdooError("The stored session has expired. Re-authenticate:\n"
+                                "  python HQ-Credentials-Manager.py ui")
+            raise OdooError(f"{name or 'OdooError'} on {model}.{method}: {message}")
+        return body.get("result")
+
+    def search_read(self, model: str, domain: list, fields: list[str] | None = None,
+                    order: str = "id asc", batch: int = 200,
+                    limit: int | None = None) -> list[dict]:
+        rows: list[dict] = []
+        offset = 0
+        while True:
+            take = batch if limit is None else min(batch, limit - len(rows))
+            if take <= 0:
+                break
+            kwargs: dict[str, Any] = {"offset": offset, "limit": take, "order": order}
+            if fields:
+                kwargs["fields"] = fields
+            page = self.call_kw(model, "search_read", [domain], kwargs)
+            rows.extend(page)
+            if len(page) < take:
+                break
+            offset += take
+        log.debug("read %d %s", len(rows), model)
+        return rows
+
+
+def load_task_descriptions(client: OdooSessionClient,
+                           task_ids: list[int]) -> dict[int, str]:
+    descriptions: dict[int, str] = {}
+    for start in range(0, len(task_ids), TASK_DESCRIPTION_BATCH):
+        chunk = task_ids[start:start + TASK_DESCRIPTION_BATCH]
+        rows = client.search_read("project.task", [["id", "in", chunk]],
+                                  fields=["id", "description"],
+                                  batch=len(chunk))
+        for row in rows:
+            raw = strip_images(row.get("description") or "")
+            descriptions[row["id"]] = html_to_markdown(raw)
+    filled = sum(1 for text in descriptions.values() if text)
+    log.debug("descriptions: %d of %d tasks have content",
+              filled, len(descriptions))
+    return descriptions
