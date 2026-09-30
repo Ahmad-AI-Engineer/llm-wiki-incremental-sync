@@ -1,5 +1,6 @@
 from __future__ import annotations
 import html
+import http.client
 import json
 import logging
 import logging.handlers
@@ -47,6 +48,10 @@ RATE_LIMIT_FALLBACK = 30.0
 PACING_START = 2.0
 PACING_STEP = 0.4
 PACING_MAX = 3.0
+SERVER_ERROR_CODES = {500, 502, 503, 504}
+CREATE_ATTEMPTS = 4
+CREATE_LOOKBACK = 50
+CLOCK_SKEW_SECONDS = 120
 
 log = logging.getLogger(__name__)
 
@@ -59,12 +64,23 @@ class OutlineError(HQError):
     pass
 
 
+class OutlineUncertainError(OutlineError):
+    pass
+
+
 class OdooError(HQError):
     pass
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _epoch(stamp: Any) -> float:
+    try:
+        return datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
 
 
 def today_stamp() -> str:
@@ -372,13 +388,30 @@ class OutlineClient:
                      60 / self.min_interval)
 
     def call(self, endpoint: str, payload: dict | None = None,
-             timeout: int = 90, attempts: int = 4) -> dict:
+             timeout: int = 90, attempts: int = 4,
+             idempotent: bool = True) -> dict:
         body = json.dumps(payload or {}).encode()
         headers = {"Content-Type": "application/json",
                    "Accept": "application/json",
                    "Authorization": f"Bearer {self.api_key}"}
         network_tries = 0
         limit_tries = 0
+        transient_tries = 0
+
+        def transient(problem: str, cause: BaseException) -> None:
+            nonlocal transient_tries
+            if not idempotent:
+                raise OutlineUncertainError(
+                    f"{problem} on {endpoint}; the write may or may not have "
+                    "landed") from cause
+            transient_tries += 1
+            if transient_tries >= attempts:
+                raise OutlineError(f"{problem} on {endpoint}, gave up after "
+                                   f"{attempts} tries") from cause
+            log.warning("%s on %s, retrying (%d/%d)", problem, endpoint,
+                        transient_tries, attempts - 1)
+            time.sleep(2 ** transient_tries)
+
         while True:
             self._pace()
             request = urllib.request.Request(f"{self.url}/api/{endpoint}",
@@ -398,16 +431,31 @@ class OutlineClient:
                               endpoint, wait, limit_tries)
                     time.sleep(wait)
                     continue
+                if exc.code in SERVER_ERROR_CODES:
+                    transient(f"Atlas HTTP {exc.code}", exc)
+                    continue
                 detail = exc.read()[:400].decode("utf-8", "replace")
                 raise OutlineError(
                     f"Atlas HTTP {exc.code} on {endpoint}: {detail}") from exc
             except urllib.error.URLError as exc:
+                if isinstance(exc.reason, TimeoutError):
+                    transient("Atlas timed out", exc)
+                    continue
                 network_tries += 1
                 if network_tries < attempts:
                     log.warning("%s unreachable (%s), retrying", endpoint, exc.reason)
                     time.sleep(2 ** network_tries)
                     continue
                 raise OutlineError(f"Cannot reach {self.url}: {exc.reason}") from exc
+            except TimeoutError as exc:
+                transient("Atlas timed out", exc)
+                continue
+            except (ConnectionError, http.client.HTTPException) as exc:
+                transient(f"Atlas connection dropped ({type(exc).__name__})", exc)
+                continue
+            except json.JSONDecodeError as exc:
+                transient("Atlas sent an unreadable response", exc)
+                continue
 
     def whoami(self) -> dict:
         return self.call("auth.info").get("data") or {}
@@ -440,10 +488,46 @@ class OutlineClient:
                                    "collectionId": collection_id, "publish": True}
         if parent_id:
             payload["parentDocumentId"] = parent_id
-        created = self.call("documents.create", payload).get("data") or {}
-        if not created.get("id"):
-            raise OutlineError(f"Atlas returned no document id for {title!r}")
-        return created
+        started = time.time()
+        for attempt in range(1, CREATE_ATTEMPTS + 1):
+            try:
+                created = self.call("documents.create", payload,
+                                    idempotent=False).get("data") or {}
+            except OutlineUncertainError as exc:
+                if attempt == CREATE_ATTEMPTS:
+                    raise OutlineError(f"Could not confirm {title!r} was created "
+                                       f"after {attempt} tries: {exc}") from exc
+                time.sleep(2 ** attempt)
+                landed = self.find_created(title, collection_id, parent_id,
+                                           started)
+                if landed:
+                    log.warning("create of %r got no clear answer, but it "
+                                "landed; using %s", title, landed["id"])
+                    return landed
+                log.warning("create of %r got no clear answer and did not land; "
+                            "retrying (%d/%d)", title, attempt,
+                            CREATE_ATTEMPTS - 1)
+                continue
+            if not created.get("id"):
+                raise OutlineError(f"Atlas returned no document id for {title!r}")
+            return created
+        raise OutlineError(f"Could not create {title!r}")
+
+    def find_created(self, title: str, collection_id: str,
+                     parent_id: str | None, since: float) -> dict | None:
+        payload: dict[str, Any] = {"collectionId": collection_id,
+                                   "sort": "createdAt", "direction": "DESC",
+                                   "limit": CREATE_LOOKBACK}
+        if parent_id:
+            payload["parentDocumentId"] = parent_id
+        rows = self.call("documents.list", payload).get("data") or []
+        cutoff = since - CLOCK_SKEW_SECONDS
+        for row in rows:
+            if (str(row.get("title") or "").strip() == title.strip()
+                    and (row.get("parentDocumentId") or None) == (parent_id or None)
+                    and _epoch(row.get("createdAt")) >= cutoff):
+                return row
+        return None
 
     def update_document(self, document_id: str, text: str | None = None,
                         title: str | None = None) -> dict:

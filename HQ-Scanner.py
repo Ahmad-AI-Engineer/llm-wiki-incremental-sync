@@ -1,10 +1,8 @@
 from __future__ import annotations
-
 import argparse
 import json
 from pathlib import Path
 from typing import Any
-
 from hq_common import (HISTORY_DIR, ODOO_SCAN_FILE, OUT_DIR, HQError,
                        OdooSessionClient, add_common_arguments,
                        configure_logging, get_logger, next_run_id, now_iso)
