@@ -59,6 +59,12 @@ def _ssl_context(verify: bool):
 
 def jsonrpc(url: str, path: str, params: dict, session_id: str | None = None,
             verify_ssl: bool = True, timeout: int = 60):
+    return jsonrpc_session(url, path, params, session_id, verify_ssl, timeout)[0]
+
+
+def jsonrpc_session(url: str, path: str, params: dict,
+                    session_id: str | None = None, verify_ssl: bool = True,
+                    timeout: int = 60) -> tuple:
     payload = json.dumps({"jsonrpc": "2.0", "method": "call",
                           "params": params}).encode()
     headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
@@ -70,6 +76,7 @@ def jsonrpc(url: str, path: str, params: dict, session_id: str | None = None,
         with urllib.request.urlopen(request, timeout=timeout,
                                     context=_ssl_context(verify_ssl)) as response:
             body = json.loads(response.read().decode("utf-8", "replace"))
+            cookies = response.headers.get_all("Set-Cookie") or []
     except urllib.error.HTTPError as exc:
         raise OdooAuthError(f"HTTP {exc.code} from {path}: {exc.reason}") from exc
     except urllib.error.URLError as exc:
@@ -79,7 +86,10 @@ def jsonrpc(url: str, path: str, params: dict, session_id: str | None = None,
         data = body["error"].get("data") or {}
         message = data.get("message") or body["error"].get("message") or "unknown error"
         raise OdooAuthError(f"{data.get('name', 'OdooError')}: {str(message).strip()}")
-    return body.get("result")
+    rotated = next((found.group(1) for found in
+                    (re.match(r"\s*session_id=([^;]+)", c) for c in cookies)
+                    if found), None)
+    return body.get("result"), rotated
 
 
 class OdooSessionAuth:
@@ -199,10 +209,17 @@ def load_credentials(path: Path = CRED_FILE) -> dict:
 
 
 def validate_credentials(record: dict) -> dict:
-    info = jsonrpc(record["odoo_url"], "/web/session/get_session_info", {},
-                   record.get("session_id"), record.get("verify_ssl", True)) or {}
+    info, rotated = jsonrpc_session(record["odoo_url"],
+                                    "/web/session/get_session_info", {},
+                                    record.get("session_id"),
+                                    record.get("verify_ssl", True))
+    info = info or {}
     if not info.get("uid"):
         raise OdooAuthError("The stored session has expired. Log in again.")
+    if rotated and rotated != record.get("session_id"):
+        log.info("odoo rotated the session; storing the new one")
+        record["session_id"] = rotated
+        record["rotated_at"] = now_iso()
     record["uid"] = info["uid"]
     record["username"] = info.get("username", record.get("username"))
     record["db"] = info.get("db", record.get("db"))

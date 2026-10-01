@@ -553,7 +553,8 @@ class OutlineClient:
 
 class OdooSessionClient:
 
-    def __init__(self, credentials: dict) -> None:
+    def __init__(self, credentials: dict, path: Path | None = None) -> None:
+        self.path = path
         self.url = credentials["odoo_url"].rstrip("/")
         self.session_id = credentials["session_id"]
         self.db = credentials.get("db")
@@ -569,7 +570,23 @@ class OdooSessionClient:
             raise OdooError(
                 f"No stored session at {path}\n"
                 "Authenticate first:  python HQ-Credentials-Manager.py ui")
-        return cls(json.loads(path.read_text(encoding="utf-8")))
+        return cls(json.loads(path.read_text(encoding="utf-8")), path)
+
+    def _adopt_rotated_session(self, headers: Any) -> None:
+        for cookie in headers.get_all("Set-Cookie") or []:
+            found = re.match(r"\s*session_id=([^;]+)", cookie)
+            if not found or found.group(1) == self.session_id:
+                continue
+            self.session_id = found.group(1)
+            log.info("odoo rotated the session; using the new one")
+            if self.path and self.path.exists():
+                record = json.loads(self.path.read_text(encoding="utf-8"))
+                record["session_id"] = self.session_id
+                record["rotated_at"] = now_iso()
+                staging = self.path.with_suffix(".tmp")
+                staging.write_text(json.dumps(record, indent=2), encoding="utf-8")
+                staging.replace(self.path)
+            return
 
     def call_kw(self, model: str, method: str, args: list,
                 kwargs: dict | None = None, timeout: int = 180) -> Any:
@@ -588,6 +605,7 @@ class OdooSessionClient:
             with urllib.request.urlopen(request, timeout=timeout,
                                         context=context) as response:
                 body = json.loads(response.read().decode("utf-8", "replace"))
+                headers = response.headers
         except urllib.error.HTTPError as exc:
             raise OdooError(f"HTTP {exc.code} calling {model}.{method}: "
                             f"{exc.reason}") from exc
@@ -603,6 +621,7 @@ class OdooSessionClient:
                 raise OdooError("The stored session has expired. Re-authenticate:\n"
                                 "  python HQ-Credentials-Manager.py ui")
             raise OdooError(f"{name or 'OdooError'} on {model}.{method}: {message}")
+        self._adopt_rotated_session(headers)
         return body.get("result")
 
     def search_read(self, model: str, domain: list, fields: list[str] | None = None,

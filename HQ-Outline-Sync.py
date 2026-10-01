@@ -22,6 +22,7 @@ SECTIONS = ["Overview", "Customer Introduction", "Tasks", "Roadmap",
 ODOO_ID_MARKER = "odoo-project-id"
 DUPLICATE_THRESHOLD = 0.34
 PREVIEW_ROWS = 12
+FAILURE_STREAK_LIMIT = 3
 
 STOPWORDS = {"the", "inc", "llc", "ltd", "co", "gmbh", "bv", "srl", "corp",
              "company", "odoo", "implementation", "project", "and", "of", "for",
@@ -666,6 +667,8 @@ def cmd_sync_all(args: argparse.Namespace) -> int:
     log.info("sync run %s: creating %d project pages", run_id, len(todo))
     created_records: list[dict] = []
     failures: list[dict] = []
+    streak = 0
+    stopped_early: str | None = None
 
     for index, row in enumerate(todo, start=1):
         project = projects.get(row["odoo_id"])
@@ -695,11 +698,21 @@ def cmd_sync_all(args: argparse.Namespace) -> int:
                      index, len(todo), project["id"],
                      str(project.get("name"))[:40], created.get("url"),
                      created["task_pages"])
+            streak = 0
         except HQError as exc:
             failures.append({"odoo_id": project["id"],
                              "odoo_name": project.get("name"), "error": str(exc)})
             log.error("[%d/%d] odoo#%s failed: %s", index, len(todo), project["id"],
                       str(exc).splitlines()[0][:140])
+            if not isinstance(exc, SyncError):
+                streak += 1
+            if streak >= FAILURE_STREAK_LIMIT:
+                stopped_early = (f"{streak} projects failed in a row; last error: "
+                                 f"{str(exc).splitlines()[0][:160]}")
+                log.error("stopping the run: %s. %d of %d projects not attempted; "
+                          "rerun to continue once Atlas and Odoo are reachable",
+                          stopped_early, len(todo) - index, len(todo))
+                break
         if args.delay:
             time.sleep(args.delay)
 
@@ -718,6 +731,7 @@ def cmd_sync_all(args: argparse.Namespace) -> int:
             "attempted": len(todo),
             "created": len(created_records),
             "failed": len(failures),
+            "stopped_early": stopped_early,
         },
         "created": created_records,
         "failures": failures,
@@ -729,9 +743,13 @@ def cmd_sync_all(args: argparse.Namespace) -> int:
     if failures:
         append_sync_log([f"- {now_iso()} FAILED odoo#{f['odoo_id']}: "
                          f"{f['error'].splitlines()[0][:160]}" for f in failures])
+    if stopped_early:
+        append_sync_log([f"- {now_iso()} STOPPED run {run_id}: {stopped_early}"])
     log.info("created %d, failed %d; run record %s",
              len(created_records), len(failures), record_path.name)
     print("\n  refresh the Atlas snapshot:  python Outline-Scanner.py scan")
+    if stopped_early:
+        return 1
     return 1 if failures and not created_records else 0
 
 
