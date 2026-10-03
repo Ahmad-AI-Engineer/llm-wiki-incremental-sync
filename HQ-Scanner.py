@@ -9,6 +9,7 @@ from hq_common import (HISTORY_DIR, ODOO_SCAN_FILE, OUT_DIR, HQError,
 
 PROJECT_SCAN_FIELDS = ["id", "name", "active", "sale_line_id"]
 TASK_SCAN_FIELDS = ["id", "name", "project_id", "user_ids"]
+TASK_SYNC_FIELDS = ["id", "name", "project_id", "user_ids", "write_date"]
 
 GENERIC_CATEGORIES = {"all", "all / saleable", "all / expenses", "all / deliveries",
                       "all / saleable / events", "goods", "services"}
@@ -122,6 +123,38 @@ def load_tasks(client: OdooSessionClient, project_ids: list[int],
                           for uid in (task.get("user_ids") or [])],
         })
     return by_project, len(tasks)
+
+
+def list_projects(client: OdooSessionClient, practice: str,
+                  include_archived: bool) -> list[dict]:
+    domain: list[Any] = [["active", "in", [True, False]]] if include_archived else []
+    projects = client.search_read("project.project", domain,
+                                  fields=PROJECT_SCAN_FIELDS, order="name asc")
+    selected, _ = select_projects(projects, load_practices(client, projects),
+                                  practice, None)
+    return selected
+
+
+def fetch_tasks(client: OdooSessionClient, project_ids: list[int],
+                include_archived: bool, since: str | None = None) -> list[dict]:
+    if not project_ids:
+        return []
+    domain: list[Any] = [["project_id", "in", project_ids]]
+    if since:
+        domain.append(["write_date", ">", since])
+    if include_archived:
+        domain.append(["active", "in", [True, False]])
+    rows = client.search_read("project.task", domain, fields=TASK_SYNC_FIELDS,
+                              batch=500)
+    names = load_user_names(
+        client, {uid for row in rows for uid in (row.get("user_ids") or [])})
+    return [{"id": row["id"],
+             "name": row.get("name"),
+             "project_id": id_of(row.get("project_id")),
+             "write_date": row["write_date"],
+             "assignees": [names.get(uid) or f"user:{uid}"
+                           for uid in (row.get("user_ids") or [])]}
+            for row in rows]
 
 
 def scan(client: OdooSessionClient, practice: str = "Odoo",

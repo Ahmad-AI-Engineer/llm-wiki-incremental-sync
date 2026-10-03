@@ -12,20 +12,43 @@ never enter the pipeline.
 Source: Odoo 19 at `https://theaxiomworld.com`, db `Axiom_HQ_19`.
 No dependencies — Python 3.11+ standard library only.
 
+## Setup
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate          # Windows
+source .venv/bin/activate       # Linux / macOS
+```
+
+There is nothing to `pip install`. The venv only pins the interpreter.
+
+Settings live in `.env` (gitignored):
+
+| Variable | Purpose |
+| --- | --- |
+| `ODOO_URL` | Odoo server, default `https://theaxiomworld.com` |
+| `ODOO_USERNAME` | prefilled on the login page |
+| `ODOO_PASSWORD` | lets `HQ-Credentials-Manager.py login` run without a prompt |
+| `OUTLINE_API_KEY` | Atlas API key (admin) |
+| `OUTLINE_URL` | Atlas server, default `https://atlas.axm.app` |
+| `OUTLINE_COLLECTION_ID` | the *Odoo Projects* collection |
+| `STATE_FILE` | sync state, default `output/state.json` |
+| `SYNC_CAP` | most new projects one run creates; empty for no cap |
+| `LOG_LEVEL` | console log level, default `INFO` |
+
 ## Running it
 
 ```bash
 python main.py
 ```
 
-That is the whole thing. It runs five steps in one process:
+That is the whole thing. It runs four steps in one process:
 
 ```
-STEP 1/5  check the Odoo session   (opens the browser to log in if there is none)
-STEP 2/5  scan Odoo     -> output/projects_and_tasks.json
-STEP 3/5  scan Atlas    -> output/outline_projects.json
-STEP 4/5  compare the snapshots
-STEP 5/5  create the missing Atlas pages   (only after you answer yes)
+STEP 1/4  check the Odoo session     (opens the browser to log in if there is none)
+STEP 2/4  list projects in Odoo and Atlas, match them
+STEP 3/4  find what changed since the last run
+STEP 4/4  apply the changes          (only after you answer yes)
 ```
 
 Step 1 validates the stored `session_id` against Odoo. If the file is missing,
@@ -33,34 +56,94 @@ empty or the session has expired, it serves the login page at
 `127.0.0.1:8765`, opens a browser, and waits. On success it writes
 `credentials/odoo_session.json` and carries on — no restart needed.
 
-Step 4 prints the first few projects that have no Atlas page, then the total,
-then asks:
+Step 3 prints the plan and the projects that changed, then asks:
 
 ```
-Missing in Atlas
-  odoo#32     S00141 - Fell Technology AS                     577 tasks
-  odoo#189    S00098 - Silicon Signs                          397 tasks
-  ... and 243 more
+Plan
+  new projects to create in Atlas : 4 of 245 (SYNC_CAP 4), 1442 task subpages
+  existing pages taken into state : 0
+  projects renamed in Odoo        : 1
+  new task pages                  : 3
+  task pages to update            : 2
+  findings for review             : 150
 
-  245 projects need to be created in Atlas.
-  43 more look like duplicates of existing pages and are excluded.
-  SYNC_CAP is 4, so this run would create 4 of them.
-  That is 1,478 documents: 4 project pages, 32 sections, 1,442 task subpages.
+Changed projects
+  odoo#992    S00667 - America Cryo                          +2 new, 1 updated
+  odoo#188    S00216 - Stratus Plastics                      +1 new, 1 updated
 
-Create these projects in Atlas? [y/N]:
+Apply these changes to Atlas? [y/N]:
 ```
 
-Answering `n` (or just Enter) terminates without writing anything. Answering
-`y` creates the pages and re-scans Atlas so the snapshot reflects them.
+Answering `n` (or just Enter) terminates without writing anything. When the
+plan has no Atlas writes at all, the run only updates the sync state and does
+not ask.
 
 Nothing reaches Atlas without a `y`. Piped or scheduled runs are not
-interactive, so they refuse to create unless you pass `--yes`.
+interactive, so they refuse to write unless you pass `--yes`.
 
-Useful flags: `--yes` (skip the prompt), `--skip-scan` (reuse the snapshots on
-disk), `--no-browser`, `--practice X`, `--include-archived`, `--delay`, `-v`.
+Useful flags: `--yes` (skip the prompt), `--no-browser`, `--practice X`,
+`--include-archived`, `--delay`, `-v`.
 
-Each run writes `output/history/pipeline_<run_id>.json` recording the mode, the
-scan run ids it used, and the resulting counts.
+Each run writes `output/history/pipeline_<run_id>.json` recording the counts
+and the exact changeset: which task ids were created and updated, per project.
+
+## Incremental sync
+
+The pipeline does not rescan everything on every run.
+
+**Step 2 — which projects exist.** One listing on each side, both small: Odoo
+customer projects of the practice (id and name, no tasks), and only the
+*top-level* documents of the Atlas collection (`documents.list` with
+`parentDocumentId: null`), not the whole tree. Each Odoo project lands in one
+bucket:
+
+| Bucket | What happens |
+| --- | --- |
+| tracked | already in the sync state; goes to step 3 |
+| adopt | Atlas page carries its `odoo-project-id` marker but is not in the state yet (made by the old create-only sync); its sections and task subpages are read once and recorded |
+| create | no Atlas page and no similar title; created with all its tasks (honours `SYNC_CAP`) |
+| title matched | written by hand; recorded as a finding, never touched |
+| probable duplicate | recorded as a finding for review, never created |
+
+Atlas pages that match no Odoo project are recorded as findings too. Nothing is
+created in Odoo.
+
+**Step 3 — which tasks changed.** Every Odoo record carries `write_date`, which
+Odoo bumps on any change. Each tracked project has a watermark: the time of its
+last successful sync. One `project.task` query returns only the tasks written
+since the oldest watermark, scoped to the tracked projects; they are then
+grouped per project and filtered against each project's own watermark.
+
+- task with no Atlas page: a new subpage under `Tasks`
+- task with a page: the page title and body are rewritten from Odoo
+- project name changed in Odoo: the project page is retitled
+
+A project without a watermark (just adopted, or a run that was interrupted
+while creating it) gets one full read of its own tasks instead, and a page is
+rewritten only when the task changed after the page was last written.
+
+The sync state knows which Atlas document belongs to which Odoo task, so
+every write goes straight to that document.
+
+## Sync state
+
+**For now the state is a JSON file, `output/state.json`, not a real Postgres
+database.** It holds the same tables and columns as the planned data model
+(`collections`, `categories`, `page_statuses`, `pages`, `sources`,
+`page_sources`, `routing_hints`, `routing_hint_pages`, `lint_findings`), one
+list of rows per table, so moving to Postgres later means replacing
+`hq_state.py` and nothing else.
+
+| Table | Used for |
+| --- | --- |
+| `pages` | every tracked Atlas document: project page, its 8 sections, task subpages. `last_synced_at` on a project page is that project's watermark |
+| `sources` / `page_sources` | which Odoo project or task a page came from (`odoo_project`, `odoo_task`) |
+| `categories` | `Project`, the 8 section names, `Task` |
+| `lint_findings` | title matches, probable duplicates, Atlas-only pages, projects missing a `Tasks` section. An open finding is not recorded twice |
+| `routing_hints`, `routing_hint_pages` | present, not used yet |
+
+The file is rewritten after every Atlas write, so an interrupted run never
+forgets a page it created and never creates it twice.
 
 The individual scripts below remain runnable on their own for inspection and
 for one-off work.
@@ -70,6 +153,7 @@ for one-off work.
 | Script | Role |
 | --- | --- |
 | `main.py` | **entry point** — runs the whole pipeline |
+| `hq_state.py` | the sync state (JSON file standing in for Postgres) |
 | `HQ-Credentials-Manager.py` | Odoo username/password → session token |
 | `HQ-Scanner.py` | Odoo → `output/projects_and_tasks.json` |
 | `Outline-Scanner.py` | Outline → `output/outline_projects.json` |
@@ -77,8 +161,9 @@ for one-off work.
 | `hq_common.py` | shared paths, env loading, run ids, logging, Outline client |
 | `ui/` | the browser login page (`login.html`, `login.css`) |
 
-Both sides produce a snapshot on disk, so comparison is reproducible and needs
-no API access.
+`main.py` does not use the scanners' snapshots; they remain for inspection and
+one-off work. Run on their own, both sides produce a snapshot on disk, so
+comparison is reproducible and needs no API access.
 
 `hq_common.py` exists because the four scripts have hyphens in their names,
 which are not valid Python module names — so they cannot import each other.
@@ -341,6 +426,7 @@ ones behind the 47 probable matches, so they are not all unrelated.
 
 ```
 credentials/odoo_session.json         Odoo session token (gitignored)
+output/state.json                     sync state: page mapping, watermarks, findings
 output/projects_and_tasks.json        latest Odoo scan
 output/outline_projects.json          latest Outline snapshot
 output/outline_mapping.json           Odoo id → Outline document ids
@@ -352,13 +438,17 @@ Nothing prunes `output/history/`.
 
 ## Not built yet
 
-- **Update path.** Sync is create-only, so the 22 drifted pages stay stale.
+- **Postgres.** The sync state is a JSON file for now.
+- **Writes to Odoo.** Atlas-only pages are recorded as findings, not created
+  in Odoo.
+- **Title-matched pages.** Hand-written pages matched only by title are
+  recorded as findings and never updated.
 - **The AI layer.** Tasks are copied mechanically. `Overview`,
   `Customer Introduction` and the rest need synthesis; the one good example
   (`Yunak LLC - Alper`) was researched from the client's website, which Odoo
   cannot supply.
-- **Change-driven ingest.** Snapshots are kept but not diffed run-to-run, so
-  there is no "what changed since last sync" changeset yet.
+- **Hard deletes.** A task deleted outright in Odoo leaves no `write_date`
+  behind, so its Atlas page stays. Archiving (the normal case) is a write.
 - **Scheduling.** Everything is run by hand.
 
 ## Things the code will not tell you
@@ -384,8 +474,16 @@ nobody "fixes" one of them back into a bug.
   `_form_login` detects rejection — Odoo returns 200 with the form again.
 - **A stray `Retry-After` is honoured.** `OutlineClient.call` retries 429s and
   transient network errors up to four times before giving up.
-- **The pipeline is create-only.** Nothing edits or renames an existing Atlas
-  page, which is why drift is reported but never repaired.
+- **The watermark overlaps by two minutes.** A project's tasks are read from
+  `CLOCK_SKEW_SECONDS` before its last sync, because Odoo's clock and this
+  machine's may disagree and `write_date` has whole-second precision. A task
+  changed in that window is rewritten once more on the next run; harmless.
+- **Only marker pages are updated.** `HQ-Outline-Sync.py sync`/`sync-all`
+  and `fill-tasks` stay create-only; `main.py` updates, but only pages this
+  tool made (marker or state), never title-matched ones.
+- **A failed write stops the run.** The state already holds everything written
+  before it, and the project's watermark did not move, so the next run picks up
+  where this one stopped.
 - **Task descriptions never enter the snapshot.** 99.4% of their payload is
   base64 screenshots: storing them would take `projects_and_tasks.json` from
   2.8 MB to roughly a gigabyte. They are fetched per project at write time and

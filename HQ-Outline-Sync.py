@@ -4,6 +4,8 @@ import argparse
 import json
 import re
 import time
+from collections.abc import Iterator
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -14,12 +16,15 @@ from hq_common import (HISTORY_DIR, MAPPING_FILE, ODOO_SCAN_FILE,
                        clean_title, configure_logging, env_positive_int,
                        get_logger, load_task_descriptions, next_run_id, now_iso,
                        outline_credentials)
+from hq_state import (PROJECT_CATEGORY, TASK_CATEGORY, TASKS_SECTION, State,
+                      parse_time)
 
 
 SECTIONS = ["Overview", "Customer Introduction", "Tasks", "Roadmap",
             "Customizations", "Scope of Work", "Meetings", "Case Studies"]
 
 ODOO_ID_MARKER = "odoo-project-id"
+ODOO_TIME = "%Y-%m-%d %H:%M:%S"
 DUPLICATE_THRESHOLD = 0.34
 PREVIEW_ROWS = 12
 FAILURE_STREAK_LIMIT = 3
@@ -225,6 +230,13 @@ def project_markdown(project: dict, scan_meta: dict) -> str:
     ])
 
 
+def task_entry(task: dict) -> dict:
+    return {"id": task["id"],
+            "title": task_title(task["id"], task.get("name")),
+            "full_name": clean_title(task.get("name"), limit=10_000),
+            "assignees": task.get("assignees") or []}
+
+
 def plan_for(project: dict, scan_meta: dict) -> dict:
     tasks = project.get("tasks") or []
     return {
@@ -232,30 +244,24 @@ def plan_for(project: dict, scan_meta: dict) -> dict:
         "title": clean_title(project.get("name")) or f"Project {project['id']}",
         "project_body": project_markdown(project, scan_meta),
         "sections": [{"title": section, "body": ""} for section in SECTIONS],
-        "tasks": [{"id": task["id"],
-                   "title": task_title(task["id"], task.get("name")),
-                   "full_name": clean_title(task.get("name"), limit=10_000),
-                   "assignees": task.get("assignees") or []}
-                  for task in tasks],
+        "tasks": [task_entry(task) for task in tasks],
         "task_count": len(tasks),
     }
 
 
 def create_task_pages(client: OutlineClient, odoo: OdooSessionClient,
                       collection_id: str, tasks_document_id: str,
-                      tasks: list[dict], delay: float = 0.0) -> int:
+                      tasks: list[dict],
+                      delay: float = 0.0) -> Iterator[tuple[int, dict]]:
     if not tasks:
-        return 0
+        return
     descriptions = load_task_descriptions(odoo, [task["id"] for task in tasks])
-    made = 0
     for task in reversed(tasks):
         body = task_page_markdown(task, descriptions.get(task["id"], ""))
-        client.create_document(task["title"], body, collection_id,
-                               tasks_document_id)
-        made += 1
+        yield task["id"], client.create_document(task["title"], body, collection_id,
+                                                 tasks_document_id)
         if delay:
             time.sleep(delay)
-    return made
 
 
 def create_project_page(client: OutlineClient, collection_id: str, plan: dict,
@@ -273,8 +279,8 @@ def create_project_page(client: OutlineClient, collection_id: str, plan: dict,
     tasks_section = next((s for s in created if s["title"] == "Tasks"), None)
     task_pages = 0
     if odoo is not None and tasks_section:
-        task_pages = create_task_pages(client, odoo, collection_id,
-                                       tasks_section["id"], plan["tasks"], delay)
+        task_pages = sum(1 for _ in create_task_pages(
+            client, odoo, collection_id, tasks_section["id"], plan["tasks"], delay))
 
     return {"document_id": parent["id"], "title": plan["title"],
             "url": parent.get("url"), "sections": created,
@@ -375,6 +381,168 @@ def task_gaps(client: OutlineClient, rows: list[dict], projects: dict,
                          "present": len(section.get("children") or []),
                          "tasks": absent})
     return gaps, skipped
+
+
+def odoo_time(value: str) -> datetime:
+    return datetime.strptime(value, ODOO_TIME).replace(tzinfo=timezone.utc)
+
+
+def reconcile(projects: list[dict], roots: list[dict],
+              managed: dict[int, dict]) -> dict:
+    by_marker, _, by_title = index_pages(roots)
+    titles = [str(root.get("title") or "") for root in roots]
+    claimed = {entry["document_id"] for entry in managed.values()}
+    found: dict[str, list] = {"managed": [], "adopt": [], "create": [],
+                              "title_matched": [], "probable": []}
+    for project in projects:
+        if project["id"] in managed:
+            found["managed"].append(project)
+            continue
+        root = by_marker.get(project["id"])
+        if root:
+            claimed.add(root["id"])
+            found["adopt"].append((project, root))
+            continue
+        root = by_title.get(normalize_title(project.get("name") or ""))
+        if root:
+            claimed.add(root["id"])
+            found["title_matched"].append((project, root))
+            continue
+        near = nearest_titles(project.get("name") or "", titles)
+        if near and near[0][0] >= DUPLICATE_THRESHOLD:
+            found["probable"].append((project, near[0]))
+        else:
+            found["create"].append(project)
+    found["atlas_only"] = [root for root in roots if root["id"] not in claimed]
+    return found
+
+
+def findings_for(found: dict) -> list[tuple[str, str]]:
+    return ([("info", f"Matched by title only, not synced: odoo#{project['id']} "
+                      f"{project.get('name')} -> {root.get('title')}")
+             for project, root in found["title_matched"]]
+            + [("warning", f"Probable duplicate, needs review: odoo#{project['id']} "
+                           f"{project.get('name')} ~{score:.2f} {title}")
+               for project, (score, title) in found["probable"]]
+            + [("warning", f"In Atlas only, no Odoo customer project: "
+                           f"{root.get('title')} ({root.get('url')})")
+               for root in found["atlas_only"]])
+
+
+def read_tree(client: OutlineClient, collection_id: str, root: dict) -> dict:
+    sections = client.all_documents(collection_id, parentDocumentId=root["id"])
+    tasks_section = next((section for section in sections
+                          if section.get("title") == TASKS_SECTION), None)
+    task_documents = (client.all_documents(collection_id,
+                                           parentDocumentId=tasks_section["id"])
+                      if tasks_section else [])
+    return {"root": root,
+            "sections": sections,
+            "tasks_section": tasks_section,
+            "tasks": {task_id: document for document in task_documents
+                      if (task_id := task_id_of(document.get("title"))) is not None}}
+
+
+def task_changes(tasks: list[dict], pages: dict[int, dict],
+                 since: dict[int, datetime]) -> dict[int, dict]:
+    changes: dict[int, dict] = {}
+    for task in tasks:
+        page = pages.get(task["id"])
+        if page and odoo_time(task["write_date"]) <= (
+                since.get(task["project_id"]) or page["updated_at"]):
+            continue
+        change = changes.setdefault(task["project_id"], {"create": [], "update": []})
+        if page:
+            change["update"].append((task, page))
+        else:
+            change["create"].append(task)
+    return changes
+
+
+def create_tracked_project(client: OutlineClient, odoo: OdooSessionClient,
+                           state: State, collection_id: str, project: dict,
+                           synced_at: datetime, delay: float) -> None:
+    plan = plan_for(project, {"odoo_url": odoo.url})
+    now = datetime.now(timezone.utc)
+    root = client.create_document(plan["title"], plan["project_body"], collection_id)
+    root_page = state.save_page(root, PROJECT_CATEGORY, None, None,
+                                ("odoo_project", project["id"]))
+    state.write()
+    tasks_document = tasks_page = None
+    for section in reversed(plan["sections"]):
+        document = client.create_document(section["title"], section["body"],
+                                          collection_id, root["id"])
+        page_id = state.save_page(document, section["title"], root_page, now)
+        state.write()
+        if section["title"] == TASKS_SECTION:
+            tasks_document, tasks_page = document["id"], page_id
+    for task_id, document in create_task_pages(client, odoo, collection_id,
+                                               tasks_document, plan["tasks"], delay):
+        state.save_page(document, TASK_CATEGORY, tasks_page, now,
+                        ("odoo_task", task_id))
+        state.write()
+    state.mark_synced(root_page, synced_at)
+    log_created(project, root, client.url, plan["task_count"])
+
+
+def adopt_tree(state: State, project_id: int, tree: dict) -> dict:
+    now = datetime.now(timezone.utc)
+    root_page = state.save_page(tree["root"], PROJECT_CATEGORY, None, None,
+                                ("odoo_project", project_id))
+    tasks_page = None
+    for section in tree["sections"]:
+        if section.get("title") in SECTIONS:
+            page_id = state.save_page(section, section["title"], root_page, now)
+            if section is tree["tasks_section"]:
+                tasks_page = page_id
+    for task_id, document in tree["tasks"].items():
+        state.save_page(document, TASK_CATEGORY, tasks_page, now,
+                        ("odoo_task", task_id))
+    state.write()
+    return {"page_id": root_page,
+            "document_id": tree["root"]["id"],
+            "title": tree["root"]["title"],
+            "watermark": None,
+            "tasks_page_id": tasks_page,
+            "tasks_document_id": (tree["tasks_section"]["id"]
+                                  if tree["tasks_section"] else None)}
+
+
+def rename_project(client: OutlineClient, state: State, entry: dict,
+                   project: dict) -> None:
+    title = clean_title(project.get("name"))
+    document = client.update_document(entry["document_id"], title=title)
+    state.save_page(document, PROJECT_CATEGORY, None, None)
+    state.write()
+    append_sync_log([f"- {now_iso()} RENAME odoo#{project['id']} "
+                     f"{entry['title']!r} -> {title!r}"])
+
+
+def apply_change(client: OutlineClient, odoo: OdooSessionClient, state: State,
+                 collection_id: str, project: dict, entry: dict, change: dict,
+                 delay: float) -> None:
+    now = datetime.now(timezone.utc)
+    for task_id, document in create_task_pages(
+            client, odoo, collection_id, entry["tasks_document_id"],
+            [task_entry(task) for task in change["create"]], delay):
+        state.save_page(document, TASK_CATEGORY, entry["tasks_page_id"], now,
+                        ("odoo_task", task_id))
+        state.write()
+    descriptions = load_task_descriptions(
+        odoo, [task["id"] for task, _ in change["update"]])
+    for task, page in change["update"]:
+        item = task_entry(task)
+        document = client.update_document(
+            page["document_id"], title=item["title"],
+            text=task_page_markdown(item, descriptions.get(task["id"], "")))
+        state.save_page(document, TASK_CATEGORY, entry["tasks_page_id"], now,
+                        ("odoo_task", task["id"]))
+        state.write()
+        if delay:
+            time.sleep(delay)
+    append_sync_log([f"- {now_iso()} UPDATE odoo#{project['id']} "
+                     f"{project.get('name')!r} +{len(change['create'])} new, "
+                     f"{len(change['update'])} updated task pages"])
 
 
 def resolve_cap(cli_limit: int | None) -> tuple[int | None, str | None]:
@@ -585,9 +753,9 @@ def cmd_fill_tasks(args: argparse.Namespace) -> int:
     for index, entry in enumerate(gaps, start=1):
         row = entry["row"]
         try:
-            count = create_task_pages(client, odoo, collection,
-                                      entry["section_id"], entry["tasks"],
-                                      args.delay)
+            count = sum(1 for _ in create_task_pages(
+                client, odoo, collection, entry["section_id"], entry["tasks"],
+                args.delay))
             made += count
             append_sync_log([f"- {now_iso()} FILL odoo#{row['odoo_id']} "
                              f"{row['odoo_name']!r} +{count} task subpages"])

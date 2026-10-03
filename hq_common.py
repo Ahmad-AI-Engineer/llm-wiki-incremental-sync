@@ -467,11 +467,13 @@ class OutlineClient:
         return self.call("collections.documents",
                          {"id": collection_id}).get("data") or []
 
-    def all_documents(self, collection_id: str, batch: int = 100) -> list[dict]:
+    def all_documents(self, collection_id: str, batch: int = 100,
+                      **filters: Any) -> list[dict]:
         documents: list[dict] = []
         offset = 0
         while True:
             page = self.call("documents.list", {"collectionId": collection_id,
+                                                **filters,
                                                 "limit": batch, "offset": offset})
             rows = page.get("data") or []
             documents.extend(rows)

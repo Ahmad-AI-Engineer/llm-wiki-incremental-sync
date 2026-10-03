@@ -78,6 +78,14 @@ def task_names_for(sections: list[dict], by_id: dict[str, dict]) -> list[str]:
     return names
 
 
+def list_roots(client: OutlineClient, collection_id: str) -> list[dict]:
+    roots = client.all_documents(collection_id, parentDocumentId=None)
+    for root in roots:
+        marker = ODOO_ID_PATTERN.search(root.get("text") or "")
+        root["odoo_project_id"] = int(marker.group(1)) if marker else None
+    return roots
+
+
 def scan(client: OutlineClient, collection_id: str,
          out_dir: Path = OUT_DIR) -> dict:
     run_id = next_run_id("outline")
