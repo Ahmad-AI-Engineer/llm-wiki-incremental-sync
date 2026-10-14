@@ -42,7 +42,7 @@ Settings live in `.env` (gitignored):
 python main.py
 ```
 
-That is the whole thing. It runs four steps in one process:
+The pipeline runs four steps in one process:
 
 ```
 STEP 1/4  check the Odoo session     (opens the browser to log in if there is none)
@@ -56,16 +56,17 @@ empty or the session has expired, it serves the login page at
 `127.0.0.1:8765`, opens a browser, and waits. On success it writes
 `credentials/odoo_session.json` and carries on — no restart needed.
 
-Step 3 prints the plan and the projects that changed, then asks:
+Step 3 shows the plan and the projects that changed, then asks:
 
 ```
-Plan
-  new projects to create in Atlas : 4 of 245 (SYNC_CAP 4), 1442 task subpages
-  existing pages taken into state : 0
-  projects renamed in Odoo        : 1
-  new task pages                  : 3
-  task pages to update            : 2
-  findings for review             : 150
+What this run found
+  New projects: 4 of 245 to create, with 1442 task pages
+  Creation is limited to 4 projects by SYNC_CAP.
+  Existing Atlas projects to track: 0
+  Project names to update: 1
+  New task pages: 3
+  Task pages to update: 2
+  Items needing review: 150
 
 Changed projects
   odoo#992    S00667 - America Cryo                          +2 new, 1 updated
@@ -78,14 +79,41 @@ Answering `n` (or just Enter) terminates without writing anything. When the
 plan has no Atlas writes at all, the run only updates the sync state and does
 not ask.
 
-Nothing reaches Atlas without a `y`. Piped or scheduled runs are not
-interactive, so they refuse to write unless you pass `--yes`.
+Nothing reaches Atlas without a `y`, `--yes`, or `--unattended`. The
+`--unattended` flag applies the plan without a prompt and exits with an error
+if the Odoo session needs a fresh login. It never waits at the browser login
+page.
 
-Useful flags: `--yes` (skip the prompt), `--no-browser`, `--practice X`,
+Useful flags: `--yes` (skip the prompt), `--unattended`, `--no-browser`, `--practice X`,
 `--include-archived`, `--delay`, `-v`.
 
 Each run writes `output/history/pipeline_<run_id>.json` recording the counts
 and the exact changeset: which task ids were created and updated, per project.
+
+## Run automatically at midnight on Linux
+
+On the Linux machine that will run the sync, configure `.env` and sign in to
+Odoo once. Then install the cron entry:
+
+```bash
+python3 HQ-Credentials-Manager.py login
+bash scripts/install_daily_cron.sh
+crontab -l
+```
+
+The installer adds one `0 0 * * *` entry to the current user's crontab. That
+means **12:00 AM in the Linux machine's local timezone**. Cron launches
+`scripts/run_daily_sync.sh`, which runs `main.py --unattended` using `.venv`,
+`venv`, or `python3`. A lock prevents overlapping scheduled runs. No Python
+process needs to remain open between runs. Running the installer again replaces
+its existing entry; `bash scripts/install_daily_cron.sh --remove` removes it.
+
+The Odoo session must still be valid. If it expires, the scheduled run exits
+with an error instead of waiting for browser login; sign in manually with
+`python3 HQ-Credentials-Manager.py login` before the next run. Check
+`output/logs/scheduled.log` for the full scheduled-run output and
+`output/logs/pipeline.log` for detailed logging. Cron cannot run while the
+machine is off and does not automatically catch up a missed midnight run.
 
 ## Incremental sync
 

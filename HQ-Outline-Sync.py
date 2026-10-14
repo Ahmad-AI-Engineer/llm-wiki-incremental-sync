@@ -114,8 +114,9 @@ def index_pages(pages: list[dict]) -> tuple[dict, dict, dict]:
         elif key in by_title:
             if key not in _reported_collisions:
                 _reported_collisions.add(key)
-                log.warning("two atlas pages normalize to %r: %r and %r", key,
-                            by_title[key].get("title"), page.get("title"))
+                log.warning("Atlas has two pages with the same project title "
+                            "(%r). Review them before linking either page.",
+                            page.get("title"))
         else:
             by_title[key] = page
     return by_marker, by_document_id, by_title
@@ -476,11 +477,17 @@ def create_tracked_project(client: OutlineClient, odoo: OdooSessionClient,
         state.write()
         if section["title"] == TASKS_SECTION:
             tasks_document, tasks_page = document["id"], page_id
+    created_tasks = 0
+    total_tasks = len(plan["tasks"])
     for task_id, document in create_task_pages(client, odoo, collection_id,
                                                tasks_document, plan["tasks"], delay):
         state.save_page(document, TASK_CATEGORY, tasks_page, now,
                         ("odoo_task", task_id))
         state.write()
+        created_tasks += 1
+        if created_tasks % 25 == 0 or created_tasks == total_tasks:
+            log.info("Created %d/%d task pages for project %s.", created_tasks,
+                     total_tasks, project["id"])
     state.mark_synced(root_page, synced_at)
     log_created(project, root, client.url, plan["task_count"])
 
@@ -514,6 +521,7 @@ def rename_project(client: OutlineClient, state: State, entry: dict,
     document = client.update_document(entry["document_id"], title=title)
     state.save_page(document, PROJECT_CATEGORY, None, None)
     state.write()
+    log.info("Renamed project %s to %s.", project["id"], title)
     append_sync_log([f"- {now_iso()} RENAME odoo#{project['id']} "
                      f"{entry['title']!r} -> {title!r}"])
 
@@ -522,12 +530,18 @@ def apply_change(client: OutlineClient, odoo: OdooSessionClient, state: State,
                  collection_id: str, project: dict, entry: dict, change: dict,
                  delay: float) -> None:
     now = datetime.now(timezone.utc)
+    total = len(change["create"]) + len(change["update"])
+    completed = 0
     for task_id, document in create_task_pages(
             client, odoo, collection_id, entry["tasks_document_id"],
             [task_entry(task) for task in change["create"]], delay):
         state.save_page(document, TASK_CATEGORY, entry["tasks_page_id"], now,
                         ("odoo_task", task_id))
         state.write()
+        completed += 1
+        if completed % 25 == 0 or completed == total:
+            log.info("Synced %d/%d tasks for project %s.", completed, total,
+                     project["id"])
     descriptions = load_task_descriptions(
         odoo, [task["id"] for task, _ in change["update"]])
     for task, page in change["update"]:
@@ -538,6 +552,10 @@ def apply_change(client: OutlineClient, odoo: OdooSessionClient, state: State,
         state.save_page(document, TASK_CATEGORY, entry["tasks_page_id"], now,
                         ("odoo_task", task["id"]))
         state.write()
+        completed += 1
+        if completed % 25 == 0 or completed == total:
+            log.info("Synced %d/%d tasks for project %s.", completed, total,
+                     project["id"])
         if delay:
             time.sleep(delay)
     append_sync_log([f"- {now_iso()} UPDATE odoo#{project['id']} "

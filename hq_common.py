@@ -125,11 +125,19 @@ def next_run_id(prefix: str, history_dir: Path = HISTORY_DIR) -> str:
     return f"{day}-{max(used, default=0) + 1:03d}"
 
 
-CONSOLE_FORMAT = "%(asctime)s %(levelname)-7s %(message)s"
 FILE_FORMAT = "%(asctime)s %(levelname)-7s [%(name)s] %(message)s"
 
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUPS = 3
+
+
+class ConsoleFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        label = "" if record.levelno == logging.INFO else f"{record.levelname.title()}: "
+        message = f"{self.formatTime(record, '%H:%M:%S')}  {label}{record.getMessage()}"
+        if record.exc_info:
+            message += "\n" + self.formatException(record.exc_info)
+        return message
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -145,7 +153,7 @@ def configure_logging(verbose: bool = False) -> None:
     console = _handler(root, "console")
     if console is None:
         console = logging.StreamHandler()
-        console.setFormatter(logging.Formatter(CONSOLE_FORMAT, datefmt="%H:%M:%S"))
+        console.setFormatter(ConsoleFormatter())
         console._hq_role = "console"
         root.addHandler(console)
     console.setLevel(logging.DEBUG if verbose else _console_level())

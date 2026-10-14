@@ -350,10 +350,16 @@ def login_via_browser(host: str = UI_HOST, port: int = UI_PORT,
     return server.login_record
 
 
-def ensure_session(open_browser: bool = True) -> dict:
+def ensure_session(open_browser: bool = True,
+                   allow_login: bool = True) -> dict:
     try:
         record = validate_credentials(load_credentials())
     except (OdooAuthError, json.JSONDecodeError, KeyError) as exc:
+        if not allow_login:
+            raise OdooAuthError(
+                "The Odoo session is no longer usable. Sign in manually with "
+                "python HQ-Credentials-Manager.py ui before the next scheduled run."
+            ) from exc
         log.info("no usable session (%s)", str(exc).splitlines()[0])
         record = login_via_browser(open_browser=open_browser)
     save_credentials(record)
