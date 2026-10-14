@@ -19,7 +19,7 @@ TABLES = ["collections", "categories", "page_statuses", "pages", "sources",
 
 
 def parse_time(value: str | None) -> datetime | None:
-    return datetime.fromisoformat(value) if value else None
+    return datetime.fromisoformat(value.replace("Z", "+00:00")) if value else None
 
 
 class State:
