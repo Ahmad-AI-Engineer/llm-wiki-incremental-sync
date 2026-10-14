@@ -25,6 +25,10 @@ if [[ $# -ne 0 ]]; then
     printf 'Usage: bash scripts/install_daily_cron.sh [--remove]\n' >&2
     exit 2
 fi
+if [[ $(date +%z) != '+0000' ]]; then
+    printf 'This installer expects the Linux server to use UTC so 19:00 is midnight in Karachi.\n' >&2
+    exit 1
+fi
 
 project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 runner="$project_dir/scripts/run_daily_sync.sh"
@@ -35,7 +39,7 @@ fi
 
 printf -v quoted_runner '%q' "$runner"
 quoted_runner=${quoted_runner//%/\\%}
-job="0 0 * * * /bin/sh $quoted_runner $marker"
+job="0 19 * * * /bin/sh $quoted_runner $marker"
 {
     if [[ -n $without_job ]]; then
         printf '%s\n' "$without_job"
@@ -43,6 +47,6 @@ job="0 0 * * * /bin/sh $quoted_runner $marker"
     printf '%s\n' "$job"
 } | crontab -
 
-printf 'Installed daily midnight cron job (Linux machine local time).\n'
+printf 'Installed daily midnight Karachi cron job (19:00 UTC).\n'
 printf 'Command: %s\n' "$job"
 printf 'Run log: %s\n' "$project_dir/output/logs/scheduled.log"

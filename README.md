@@ -101,8 +101,9 @@ bash scripts/install_daily_cron.sh
 crontab -l
 ```
 
-The installer adds one `0 0 * * *` entry to the current user's crontab. That
-means **12:00 AM in the Linux machine's local timezone**. Cron launches
+The installer adds one `0 19 * * *` entry to the current user's crontab on a
+UTC server. That means **12:00 AM in Karachi (Asia/Karachi)**. It checks that
+the server uses UTC before installing the job. Cron launches
 `scripts/run_daily_sync.sh`, which runs `main.py --unattended` using `.venv`,
 `venv`, or `python3`. A lock prevents overlapping scheduled runs. No Python
 process needs to remain open between runs. Running the installer again replaces
